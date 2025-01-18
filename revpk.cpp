@@ -278,7 +278,7 @@ static void DoPackMulti(const std::vector<std::string>& args)
         for (auto& fileKV : files)
         {
             // read the file data
-            std::ifstream ifs(fileKV.m_EntryPath, std::ios::binary);
+            std::ifstream ifs(workspace + "/content/" + language + "/" + std::string(fileKV.m_EntryPath), std::ios::binary);
             if (!ifs.good())
             {
                 std::cerr << "[ReVPK] WARNING: cannot open "
@@ -545,7 +545,7 @@ static void DoUnpackMulti(const std::vector<std::string>& args)
         fs::path manifestDir = fs::path(outPath) / "manifest";
         fs::create_directories(manifestDir);
 
-        std::string multiLangPath = (manifestDir / "multiLangUnpacked.vdf").string();
+        std::string multiLangPath = (manifestDir / "multiLangManifest.vdf").string();
         bool success = builder.BuildMultiLangManifest(languageDirs, multiLangPath);
         if (!success)
         {
