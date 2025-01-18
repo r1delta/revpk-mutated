@@ -16,15 +16,6 @@
 // Zlib for CRC32
 #include "/usr/include/zlib.h"
 
-// --- ZSTD support ---
-// 64-bit marker for easy detection:
-static constexpr uint64_t R1D_marker    = 0x5244315F5F4D4150ULL;
-// Example only; pick any 8-byte literal you like.
-// If you prefer exactly the numeric literal you gave, you can keep that:
-// static constexpr uint64_t R1D_marker = 18388560042537298ULL;
-
-// 32-bit marker if needed:
-static constexpr uint32_t R1D_marker_32 = 0x52443144; // 'R1D'
 // --------------------
 
 /** Helper: do real CRC32 using Zlib. */
@@ -457,7 +448,7 @@ void CPackedStoreBuilder::UnpackStore(const VPKDir_t& vpkDir, const char* worksp
             {
                 if (frag.m_nPackFileOffset == 0 && frag.m_nCompressedSize == 0)
                     continue; // deduplicated chunk might refer to offset in another pack file
-                    ifs.seekg(frag.m_nPackFileOffset, std::ios::beg);
+                ifs.seekg(frag.m_nPackFileOffset, std::ios::beg);
                 if (!ifs.good()) break;
 
                 ifs.read(reinterpret_cast<char*>(srcBuf.get()), frag.m_nCompressedSize);
@@ -945,4 +936,242 @@ std::string PackedStore_GetDirBaseName(const std::string& dirFileName)
         }
     }
     return dirFileName; // fallback
+}
+
+// ------------------------------------------------------------------------
+//  CPackedStoreBuilder::UnpackStoreDifferences()
+// ------------------------------------------------------------------------
+void CPackedStoreBuilder::UnpackStoreDifferences(
+    const VPKDir_t& fallbackDir,     // Typically English
+    const VPKDir_t& otherLangDir,    // Current language
+    const std::string& fallbackOutputPath, // e.g. outPath/content/english/
+    const std::string& langOutputPath      // e.g. outPath/content/spanish/
+)
+{
+    namespace fs = std::filesystem;
+
+    // We'll read from the "otherLangDir" chunk files
+    // For each file in 'otherLangDir', check if it is truly different from fallback.
+    // If yes, physically extract. If no, skip.
+
+    // Build a quick index: (CRC -> vector<filePaths>) for fallback or something chunk-based.
+    // For simplest approach, do file-level compare via CRC.
+    // If the entire file's CRC matches fallback's CRC, skip.
+
+    // 1) Make a map from <entryPath> to <CRC> for the fallback
+    std::unordered_map<std::string, uint32_t> fallbackCrcMap;
+    for (auto& fbBlock : fallbackDir.m_EntryBlocks)
+    {
+        fallbackCrcMap[fbBlock.m_EntryPath] = fbBlock.m_nFileCRC;
+    }
+
+    // 2) Open chunk file(s) for reading
+    // Because we typically have only one .vpk data pack, the offset might be the same.
+    // But in multi-lingual, you can also have separate data packs.
+    // We'll do a naive approach: for each block, open its pack file by index.
+
+    fs::path baseDir = fs::path(otherLangDir.m_DirFilePath).parent_path();
+    std::ifstream ifsPak;
+
+    // 3) For each block in 'otherLangDir'
+    for (auto& block : otherLangDir.m_EntryBlocks)
+    {
+        auto itCrc = fallbackCrcMap.find(block.m_EntryPath);
+        bool sameAsFallback = (itCrc != fallbackCrcMap.end()
+            && itCrc->second == block.m_nFileCRC);
+
+        // if the file is the same as fallback (via CRC), skip extracting
+        if (sameAsFallback)
+            continue;
+
+        // We physically extract it
+        // 3a) open the correct data file once we know block.m_iPackFileIndex
+        std::string packFileName = otherLangDir.GetPackFileNameForIndex(block.m_iPackFileIndex);
+        fs::path fullPakPath = baseDir / packFileName;
+        if (!ifsPak.is_open() || ifsPak.tellg() != std::streampos(0) || /* naive check */ true)
+        {
+            ifsPak.close();
+            ifsPak.open(fullPakPath, std::ios::binary);
+            if (!ifsPak.good())
+            {
+                std::cerr << "[ReVPK] ERROR: cannot open " << fullPakPath
+                    << " for reading\n";
+                continue;
+            }
+        }
+
+        // 3b) open output file
+        fs::path outFile = fs::path(langOutputPath) / block.m_EntryPath;
+        fs::create_directories(outFile.parent_path());
+        std::ofstream ofsOut(outFile, std::ios::binary);
+        if (!ofsOut.is_open())
+        {
+            std::cerr << "[ReVPK] ERROR: cannot create " << outFile << "\n";
+            continue;
+        }
+
+        // 3c) read each chunk
+        std::unique_ptr<uint8_t[]> srcBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+        std::unique_ptr<uint8_t[]> dstBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+
+        for (auto& frag : block.m_Fragments)
+        {
+            // if packFileOffset/CompressedSize=0 => deduplicated chunk from somewhere else
+            if (frag.m_nPackFileOffset == 0 && frag.m_nCompressedSize == 0)
+                continue;
+
+            ifsPak.seekg(frag.m_nPackFileOffset, std::ios::beg);
+            if (!ifsPak.good())
+            {
+                std::cerr << "[ReVPK] ERROR: Bad seek in " << fullPakPath << "\n";
+                break;
+            }
+
+            ifsPak.read(reinterpret_cast<char*>(srcBuf.get()), frag.m_nCompressedSize);
+
+            // decompress if needed
+            if (frag.m_nCompressedSize == frag.m_nUncompressedSize)
+            {
+                // uncompressed
+                ofsOut.write(reinterpret_cast<const char*>(srcBuf.get()), frag.m_nUncompressedSize);
+            }
+            else
+            {
+                // check for ZSTD marker
+                if (frag.m_nCompressedSize >= sizeof(R1D_marker))
+                {
+                    uint64_t possibleMarker = 0;
+                    std::memcpy(&possibleMarker, srcBuf.get(), sizeof(R1D_marker));
+                    if (possibleMarker == R1D_marker)
+                    {
+                        // ZSTD chunk
+                        size_t zstdSize = frag.m_nCompressedSize - sizeof(R1D_marker);
+                        const uint8_t* zstdData = srcBuf.get() + sizeof(R1D_marker);
+                        size_t dstLen = VPK_ENTRY_MAX_LEN;
+                        size_t dRes = ZSTD_decompress(dstBuf.get(), dstLen, zstdData, zstdSize);
+                        if (!ZSTD_isError(dRes))
+                        {
+                            ofsOut.write(reinterpret_cast<const char*>(dstBuf.get()), dRes);
+                        }
+                        else
+                        {
+                            std::cerr << "[ReVPK] ERROR: ZSTD decompress failed.\n";
+                        }
+                        continue;
+                    }
+                }
+                // LZHAM path
+                size_t dstLen = VPK_ENTRY_MAX_LEN;
+                lzham_decompress_status_t st = lzham_decompress_memory(
+                    &m_Decoder,
+                    dstBuf.get(), &dstLen,
+                    srcBuf.get(), static_cast<size_t>(frag.m_nCompressedSize),
+                    nullptr
+                );
+                if (st == LZHAM_DECOMP_STATUS_SUCCESS)
+                {
+                    ofsOut.write(reinterpret_cast<const char*>(dstBuf.get()), dstLen);
+                }
+                else
+                {
+                    std::cerr << "[ReVPK] ERROR: LZHAM decompress failed.\n";
+                }
+            }
+        }
+    }
+
+    ifsPak.close();
+}
+
+// ------------------------------------------------------------------------
+//  CPackedStoreBuilder::BuildMultiLangManifest()
+// ------------------------------------------------------------------------
+bool CPackedStoreBuilder::BuildMultiLangManifest(
+    const std::map<std::string, VPKDir_t>& languageDirs,
+    const std::string& outFilePath)
+{
+    std::ofstream ofs(outFilePath);
+    if (!ofs.good()) return false;
+
+    ofs << "\"BuildManifest\"\n{\n";
+
+    // Gather all file paths across all languages.
+    std::set<std::string> allFilePaths;
+    for (const auto& langPair : languageDirs) {
+        for (const auto& blk : langPair.second.m_EntryBlocks) {
+            allFilePaths.insert(blk.m_EntryPath);
+        }
+    }
+
+    // We'll designate "english" as fallback.
+    // For each language, we see if a block is present or if the CRC differs.
+    for (const auto& langPair : languageDirs) {
+        const std::string& lang = langPair.first;
+        const VPKDir_t& vpkDir = langPair.second;
+
+        ofs << "\t\"" << lang << "\"\n\t{\n";
+
+        // Build CRC map for this language.
+        std::unordered_map<std::string, uint32_t> crcMap;
+        for (const auto& blk : vpkDir.m_EntryBlocks) {
+            crcMap[blk.m_EntryPath] = blk.m_nFileCRC;
+        }
+
+        // Check each file path.
+        for (const std::string& filePath : allFilePaths) {
+            bool found = false;
+            bool differsFromEnglish = false;
+
+            // Determine if the file exists in this language and if it differs from English.
+            if (crcMap.count(filePath)) {
+                found = true;
+                if (lang != "english") {
+                    // Compare CRC against English.
+                    auto itEnglish = languageDirs.find("english");
+                    if (itEnglish != languageDirs.end()) {
+                        for (const auto& engBlk : itEnglish->second.m_EntryBlocks) {
+                            if (engBlk.m_EntryPath == filePath && engBlk.m_nFileCRC != crcMap[filePath]) {
+                                differsFromEnglish = true;
+                                break;
+                            }
+                        }
+                    }
+                }
+            }
+
+            // Only write out if found and not English, or if it differs from English.
+            if (found && (lang == "english" || differsFromEnglish)) {
+                // Find the block for this file path and language.
+                const VPKEntryBlock_t* blockPtr = nullptr;
+                for (const auto& blk : vpkDir.m_EntryBlocks) {
+                    if (blk.m_EntryPath == filePath) {
+                        blockPtr = &blk;
+                        break;
+                    }
+                }
+
+                if (blockPtr) {
+                    bool compressed = false;
+                    for (const auto& frag : blockPtr->m_Fragments) {
+                        if (frag.m_nCompressedSize < frag.m_nUncompressedSize) {
+                            compressed = true;
+                            break;
+                        }
+                    }
+
+                    ofs << "\t\t\"" << filePath << "\"\n"
+                        << "\t\t{\n"
+                        << "\t\t\t\"preloadSize\"\t\"" << blockPtr->m_iPreloadSize << "\"\n"
+                        << "\t\t\t\"loadFlags\"\t\"" << (blockPtr->m_Fragments.empty() ? 3 : blockPtr->m_Fragments[0].m_nLoadFlags) << "\"\n"
+                        << "\t\t\t\"textureFlags\"\t\"" << (blockPtr->m_Fragments.empty() ? 0 : blockPtr->m_Fragments[0].m_nTextureFlags) << "\"\n"
+                        << "\t\t\t\"useCompression\"\t\"" << (compressed ? "1" : "0") << "\"\n"
+                        << "\t\t\t\"deDuplicate\"\t\"1\"\n"
+                        << "\t\t}\n";
+                }
+            }
+        }
+        ofs << "\t}\n";
+    }
+    ofs << "}\n";
+    return true;
 }

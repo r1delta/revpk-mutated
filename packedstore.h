@@ -238,6 +238,20 @@ public:
     // Unpack from an existing directory file
     void UnpackStore(const VPKDir_t& vpkDir, const char* workspaceName = "");
 
+    // Unpack differences between two languages
+    void UnpackStoreDifferences(
+        const VPKDir_t& fallbackDir,     // Typically English
+        const VPKDir_t& otherLangDir,    // Current language
+        const std::string& fallbackOutputPath, // e.g. outPath/content/english/
+        const std::string& langOutputPath      // e.g. outPath/content/spanish/
+    );
+
+    // Build a multi-language manifest
+    bool BuildMultiLangManifest(
+        const std::map<std::string, VPKDir_t>& languageDirs,
+        const std::string& outFilePath
+    );
+
 public:
     lzham_compress_params   m_Encoder;
     lzham_decompress_params m_Decoder;
@@ -254,5 +268,24 @@ public:
 
 // Utility
 std::string PackedStore_GetDirBaseName(const std::string& dirFileName);
+
+// New helper struct for multi-language manifest
+struct LangKVPair_t
+{
+    std::string m_Language;
+    VPKKeyValues_t m_Keys;
+
+    LangKVPair_t(const std::string& lang, const VPKKeyValues_t& kv)
+        : m_Language(lang), m_Keys(kv) {}
+};
+// --- ZSTD support ---
+// 64-bit marker for easy detection:
+static constexpr uint64_t R1D_marker    = 0x5244315F5F4D4150ULL;
+// Example only; pick any 8-byte literal you like.
+// If you prefer exactly the numeric literal you gave, you can keep that:
+// static constexpr uint64_t R1D_marker = 18388560042537298ULL;
+
+// 32-bit marker if needed:
+static constexpr uint32_t R1D_marker_32 = 0x52443144; // 'R1D'
 
 #endif // PACKEDSTORE_H
