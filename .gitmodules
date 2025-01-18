@@ -1,0 +1,3 @@
+[submodule "lzham_alpha"]
+	path = lzham_alpha
+	url = https://github.com/richgel999/lzham_alpha.git
