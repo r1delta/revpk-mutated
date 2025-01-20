@@ -8,7 +8,8 @@ set(CMAKE_CXX_EXTENSIONS OFF)
 # Find required packages
 find_package(ZLIB REQUIRED)
 find_package(OpenSSL REQUIRED)
-find_package(zstd REQUIRED)
+find_package(PkgConfig REQUIRED)
+pkg_check_modules(ZSTD REQUIRED libzstd)
 
 # Add LZHAM subdirectory
 add_subdirectory(lzham_alpha)
@@ -24,7 +25,7 @@ target_include_directories(revpk
     PUBLIC
         ${ZLIB_INCLUDE_DIRS}
         ${OPENSSL_INCLUDE_DIR}
-        ${CMAKE_SOURCE_DIR}/lzham_alpha/include  # LZHAM public headers
+        ${CMAKE_SOURCE_DIR}/lzham_alpha/include
         ${ZSTD_INCLUDE_DIRS}
 )
 
@@ -34,7 +35,7 @@ target_link_libraries(revpk
         ${ZLIB_LIBRARIES}
         OpenSSL::SSL
         OpenSSL::Crypto
-        zstd::libzstd
+        ${ZSTD_LIBRARIES}
     PRIVATE
         lzhamdll
         lzhamcomp

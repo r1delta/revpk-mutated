@@ -25,7 +25,7 @@ static uint32_t compute_crc32(const uint8_t* data, size_t len)
 }
 
 /** Helper: do real SHA1 using OpenSSL. Returns hex string. */
-static std::string compute_sha1_hex(const uint8_t* data, size_t len)
+std::string compute_sha1_hex(const uint8_t* data, size_t len)
 {
     unsigned char hash[SHA_DIGEST_LENGTH];
     SHA1(data, len, hash);
@@ -269,10 +269,10 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
 
                     size_t zstdResult = ZSTD_compress(
                         compBuf.get() + markerSize,   // dest
-                                                      zstdBound,                    // dest capacity
-                                                      chunkBuf.get(),               // src
-                                                      frag.m_nUncompressedSize,     // src size
-                                                      22 /* or some default ZSTD level */
+                        zstdBound,                    // dest capacity
+                        chunkBuf.get(),               // src
+                        frag.m_nUncompressedSize,     // src size
+                        22 /* or some default ZSTD level */
                     );
 
                     if (!ZSTD_isError(zstdResult))
@@ -293,8 +293,8 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
                     lzham_compress_status_t st = lzham_compress_memory(
                         &m_Encoder,
                         compBuf.get(), &compSize,
-                                                                       chunkBuf.get(), frag.m_nUncompressedSize,
-                                                                       nullptr
+                        chunkBuf.get(), frag.m_nUncompressedSize,
+                        nullptr
                     );
                     if (st == LZHAM_COMP_STATUS_SUCCESS && compSize < frag.m_nUncompressedSize)
                     {
@@ -311,31 +311,32 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
             const uint8_t* finalDataPtr = compressedOk ? compBuf.get() : chunkBuf.get();
             size_t finalDataSize        = compressedOk ? compSize : frag.m_nUncompressedSize;
 
-            // 3) Prepare descriptor with final values
-            uint64_t writePos = static_cast<uint64_t>(ofsPack.tellp());
-            frag.m_nPackFileOffset   = writePos;
-            frag.m_nCompressedSize   = finalDataSize;
-
-            // 4) Try deduplication with finalized descriptor
-            bool isDuplicate = false;
-            if (kv.m_bDeduplicate)
+            // --- Deduplication Logic ---
+            std::string chunkHash = compute_sha1_hex(finalDataPtr, finalDataSize);
+            auto it = m_ChunkHashMap.find(chunkHash);
+            if (it != m_ChunkHashMap.end())
             {
-                isDuplicate = Deduplicate(finalDataPtr, frag, finalDataSize);
-                if (isDuplicate)
-                {
-                    sharedBytes += frag.m_nUncompressedSize;
-                    sharedChunks++;
-                }
+                // Existing chunk:
+                frag = it->second;
+                sharedBytes += frag.m_nUncompressedSize;
+                sharedChunks++;
             }
-
-            // 5) Write only if not a duplicate
-            if (!isDuplicate)
+            else
             {
+                // New chunk:
+                // 3) Prepare descriptor with final values
+                uint64_t writePos = static_cast<uint64_t>(ofsPack.tellp());
+                frag.m_nPackFileOffset = writePos;
+                frag.m_nCompressedSize = finalDataSize;
+
+                // 4) Write
                 ofsPack.write(reinterpret_cast<const char*>(finalDataPtr), finalDataSize);
+
+                // 5) Store in map
+                m_ChunkHashMap[chunkHash] = frag;
             }
 
             memoryOffset += frag.m_nUncompressedSize;
-            // --------------------
         }
     }
 
@@ -345,10 +346,10 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
     // Log statistics
     auto finalSize = fs::file_size(packPath);
     std::cout << "[ReVPK] Packed " << buildList.size()
-    << " files into " << packPath.filename().string()
-    << " (" << finalSize << " bytes total, "
-    << sharedBytes << " bytes deduplicated in "
-    << sharedChunks << " shared chunks)\n";
+        << " files into " << packPath.filename().string()
+        << " (" << finalSize << " bytes total, "
+        << sharedBytes << " bytes deduplicated in "
+        << sharedChunks << " shared chunks)\n";
 
     // Build directory file
     VPKDir_t dir;
@@ -789,7 +790,6 @@ std::string VPKDir_t::StripLocalePrefix(const std::string& directoryPath) const
     }
     return fname;
 }
-
 void VPKDir_t::WriteHeader(std::ofstream& /*ofs*/)
 {
     // Not used in this example.
@@ -1091,87 +1091,100 @@ bool CPackedStoreBuilder::BuildMultiLangManifest(
     const std::string& outFilePath)
 {
     std::ofstream ofs(outFilePath);
-    if (!ofs.good()) return false;
+    if (!ofs.good())
+        return false;
 
     ofs << "\"BuildManifest\"\n{\n";
 
-    // Gather all file paths across all languages.
+    // 1) Gather all file paths across all languages
     std::set<std::string> allFilePaths;
-    for (const auto& langPair : languageDirs) {
-        for (const auto& blk : langPair.second.m_EntryBlocks) {
+    for (const auto& langPair : languageDirs)
+    {
+        const VPKDir_t& vpkDir = langPair.second;
+        for (const auto& blk : vpkDir.m_EntryBlocks)
             allFilePaths.insert(blk.m_EntryPath);
+    }
+
+    // 2) Build a map of English CRCs (or blocks)
+    std::unordered_map<std::string, const VPKEntryBlock_t*> englishMap;
+    auto itEnglish = languageDirs.find("english");
+    if (itEnglish != languageDirs.end())
+    {
+        for (const auto& blk : itEnglish->second.m_EntryBlocks)
+        {
+            englishMap[blk.m_EntryPath] = &blk;
         }
     }
 
-    // We'll designate "english" as fallback.
-    // For each language, we see if a block is present or if the CRC differs.
-    for (const auto& langPair : languageDirs) {
+    // 3) For each language, write sub-block
+    for (const auto& langPair : languageDirs)
+    {
         const std::string& lang = langPair.first;
-        const VPKDir_t& vpkDir = langPair.second;
+        const VPKDir_t&    vpkDir = langPair.second;
+
+        // Build a quick map for this language, path -> block
+        std::unordered_map<std::string, const VPKEntryBlock_t*> thisLangMap;
+        for (const auto& blk : vpkDir.m_EntryBlocks)
+        {
+            thisLangMap[blk.m_EntryPath] = &blk;
+        }
 
         ofs << "\t\"" << lang << "\"\n\t{\n";
 
-        // Build CRC map for this language.
-        std::unordered_map<std::string, uint32_t> crcMap;
-        for (const auto& blk : vpkDir.m_EntryBlocks) {
-            crcMap[blk.m_EntryPath] = blk.m_nFileCRC;
-        }
-
-        // Check each file path.
-        for (const std::string& filePath : allFilePaths) {
-            bool found = false;
-            bool differsFromEnglish = false;
-
-            // Determine if the file exists in this language and if it differs from English.
-            if (crcMap.count(filePath)) {
-                found = true;
-                if (lang != "english") {
-                    // Compare CRC against English.
-                    auto itEnglish = languageDirs.find("english");
-                    if (itEnglish != languageDirs.end()) {
-                        for (const auto& engBlk : itEnglish->second.m_EntryBlocks) {
-                            if (engBlk.m_EntryPath == filePath && engBlk.m_nFileCRC != crcMap[filePath]) {
-                                differsFromEnglish = true;
-                                break;
-                            }
-                        }
-                    }
-                }
+        // 4) Iterate all possible file paths
+        for (const std::string& filePath : allFilePaths)
+        {
+            // Check if this language has a custom block
+            auto itBlock = thisLangMap.find(filePath);
+            const VPKEntryBlock_t* blockPtr = nullptr;
+            if (itBlock != thisLangMap.end())
+            {
+                // Language has a unique (or differing) version
+                blockPtr = itBlock->second;
+            }
+            else
+            {
+                // Fallback to English (if English has it)
+                auto itEng = englishMap.find(filePath);
+                if (itEng != englishMap.end())
+                    blockPtr = itEng->second;
             }
 
-            // Only write out if found and not English, or if it differs from English.
-            if (found && (lang == "english" || differsFromEnglish)) {
-                // Find the block for this file path and language.
-                const VPKEntryBlock_t* blockPtr = nullptr;
-                for (const auto& blk : vpkDir.m_EntryBlocks) {
-                    if (blk.m_EntryPath == filePath) {
-                        blockPtr = &blk;
+            // If we found a block (either language or fallback), write a manifest entry
+            if (blockPtr)
+            {
+                bool compressed = false;
+                for (const auto& frag : blockPtr->m_Fragments)
+                {
+                    if (frag.m_nCompressedSize < frag.m_nUncompressedSize)
+                    {
+                        compressed = true;
                         break;
                     }
                 }
 
-                if (blockPtr) {
-                    bool compressed = false;
-                    for (const auto& frag : blockPtr->m_Fragments) {
-                        if (frag.m_nCompressedSize < frag.m_nUncompressedSize) {
-                            compressed = true;
-                            break;
-                        }
-                    }
-
-                    ofs << "\t\t\"" << filePath << "\"\n"
-                        << "\t\t{\n"
-                        << "\t\t\t\"preloadSize\"\t\"" << blockPtr->m_iPreloadSize << "\"\n"
-                        << "\t\t\t\"loadFlags\"\t\"" << (blockPtr->m_Fragments.empty() ? 3 : blockPtr->m_Fragments[0].m_nLoadFlags) << "\"\n"
-                        << "\t\t\t\"textureFlags\"\t\"" << (blockPtr->m_Fragments.empty() ? 0 : blockPtr->m_Fragments[0].m_nTextureFlags) << "\"\n"
-                        << "\t\t\t\"useCompression\"\t\"" << (compressed ? "1" : "0") << "\"\n"
-                        << "\t\t\t\"deDuplicate\"\t\"1\"\n"
-                        << "\t\t}\n";
-                }
+                ofs << "\t\t\"" << filePath << "\"\n"
+                    << "\t\t{\n"
+                    << "\t\t\t\"preloadSize\"\t\"" << blockPtr->m_iPreloadSize << "\"\n"
+                    << "\t\t\t\"loadFlags\"\t\""
+                            << (blockPtr->m_Fragments.empty()
+                                ? 3
+                                : blockPtr->m_Fragments[0].m_nLoadFlags)
+                            << "\"\n"
+                    << "\t\t\t\"textureFlags\"\t\""
+                            << (blockPtr->m_Fragments.empty()
+                                ? 0
+                                : blockPtr->m_Fragments[0].m_nTextureFlags)
+                            << "\"\n"
+                    << "\t\t\t\"useCompression\"\t\"" << (compressed ? "1" : "0") << "\"\n"
+                    << "\t\t\t\"deDuplicate\"\t\"1\"\n"
+                    << "\t\t}\n";
             }
         }
+
         ofs << "\t}\n";
     }
+
     ofs << "}\n";
     return true;
 }

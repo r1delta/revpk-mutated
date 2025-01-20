@@ -8,6 +8,7 @@
 #include <fstream>
 #include <iostream>
 #include <filesystem>
+#include <cstring>
 
 bool LoadKeyValuesManifest(const std::string& vdfPath, std::vector<VPKKeyValues_t>& outList)
 {
@@ -67,6 +68,9 @@ bool LoadKeyValuesManifest(const std::string& vdfPath, std::vector<VPKKeyValues_
         auto itDeduplicate = child.attribs.find("deDuplicate");
         if (itDeduplicate != child.attribs.end())
             val.m_bDeduplicate = (std::stoi(itDeduplicate->second) != 0);
+//if (strncmp(val.m_EntryPath.c_str(), "sound/", 6) == 0) {
+//    val.m_bUseCompression = false;
+//}
 
         outList.push_back(val);
     }

@@ -36,7 +36,7 @@ static constexpr uint32_t VPK_HEADER_MARKER = 0x55AA1234;
 static constexpr uint16_t VPK_MAJOR_VERSION = 2;
 static constexpr uint16_t VPK_MINOR_VERSION = 3;
 static constexpr uint32_t VPK_DICT_SIZE     = 20;          // LZHAM dictionary size (log2)
-static constexpr size_t   VPK_ENTRY_MAX_LEN = 1024 * 1024 * 200; // 1 MiB
+static constexpr size_t   VPK_ENTRY_MAX_LEN = 1024 * 1024; // 1 MiB
 static constexpr uint16_t PACKFILEINDEX_SEP = 0x0000;
 static constexpr uint16_t PACKFILEINDEX_END = 0xffff;
 
@@ -287,5 +287,6 @@ static constexpr uint64_t R1D_marker    = 0x5244315F5F4D4150ULL;
 
 // 32-bit marker if needed:
 static constexpr uint32_t R1D_marker_32 = 0x52443144; // 'R1D'
+std::string compute_sha1_hex(const uint8_t* data, size_t len);
 
 #endif // PACKEDSTORE_H

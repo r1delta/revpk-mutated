@@ -167,7 +167,9 @@ static bool LoadMultiLangManifest(const std::string& manifestFile,
             kv.m_nTextureFlags = (uint16_t)std::stoi(pFileObj->attribs["textureFlags"]);
             kv.m_bUseCompression = (pFileObj->attribs["useCompression"] == "1");
             kv.m_bDeduplicate = (pFileObj->attribs["deDuplicate"] == "1");
-
+//if (strncmp(kv.m_EntryPath.c_str(), "sound/", 6) == 0) {
+//    kv.m_bUseCompression = false;
+//}
             outLangMap[language].push_back(kv);
         }
     }
@@ -277,26 +279,39 @@ static void DoPackMulti(const std::vector<std::string>& args)
         // For each file in this language:
         for (auto& fileKV : files)
         {
-            // read the file data
-            std::ifstream ifs(workspace + "/content/" + language + "/" + std::string(fileKV.m_EntryPath), std::ios::binary);
-            if (!ifs.good())
+            // --- CHANGE #2 ---
+            // Attempt to open from the language’s folder first
+            std::string langPath = workspace + "content/" + language + "/" + fileKV.m_EntryPath;
+            std::ifstream ifFile(langPath, std::ios::binary);
+
+            if (!ifFile.good())
             {
-                std::cerr << "[ReVPK] WARNING: cannot open "
-                    << fileKV.m_EntryPath << " for reading\n";
-                continue;
+                // fallback to English
+                std::string engPath = workspace + "content/english/" + fileKV.m_EntryPath;
+                ifFile.open(engPath, std::ios::binary);
+                if (!ifFile.good())
+                {
+                    std::cerr << "[ReVPK] WARNING: Could not open either "
+                              << langPath << " or " << engPath << "\n";
+                    continue; // no file at all, skip
+                }
             }
-            ifs.seekg(0, std::ios::end);
-            std::streamoff len = ifs.tellg();
+
+            // now ifFile is valid, proceed to read
+            ifFile.seekg(0, std::ios::end);
+            std::streamoff len = ifFile.tellg();
+            ifFile.seekg(0, std::ios::beg);
+
             if (len <= 0)
             {
-                std::cerr << "[ReVPK] WARNING: file " << fileKV.m_EntryPath
-                    << " is empty\n";
+                std::cerr << "[ReVPK] WARNING: " << fileKV.m_EntryPath << " is empty.\n";
                 continue;
             }
-            ifs.seekg(0, std::ios::beg);
+
             std::unique_ptr<uint8_t[]> fileData(new uint8_t[size_t(len)]);
-            ifs.read(reinterpret_cast<char*>(fileData.get()), len);
-            ifs.close();
+            ifFile.read(reinterpret_cast<char*>(fileData.get()), len);
+            ifFile.close();
+            // --- END CHANGE #2 ---
 
             // create a VPKEntryBlock
             VPKEntryBlock_t block(fileData.get(), size_t(len), 0,
@@ -314,81 +329,70 @@ static void DoPackMulti(const std::vector<std::string>& args)
                 // Compress if useCompression = true
                 bool compressedOk = false;
                 size_t compSize = frag.m_nUncompressedSize;
-                if (fileKV.m_bUseCompression)
-                {
-                    if (builder.IsUsingZSTD())
-                    {
-                        // ZSTD compression path
-                        // (You can pass an integer level, e.g. 22 or parse from string)
-                        constexpr size_t markerSize = sizeof(R1D_marker);
-                        std::memcpy(compBuf.get(), &R1D_marker, markerSize);
+if (fileKV.m_bUseCompression)
+{
+    if (builder.IsUsingZSTD())
+    {
+        constexpr size_t markerSize = sizeof(R1D_marker);
+        std::memcpy(compBuf.get(), &R1D_marker, markerSize);
 
-                        size_t zstdBound = ZSTD_compressBound(frag.m_nUncompressedSize);
-                        if (zstdBound + markerSize > VPK_ENTRY_MAX_LEN)
-                            zstdBound = VPK_ENTRY_MAX_LEN - markerSize;
+        size_t zstdBound = ZSTD_compressBound(frag.m_nUncompressedSize);
+        if (zstdBound + markerSize > VPK_ENTRY_MAX_LEN)
+            zstdBound = VPK_ENTRY_MAX_LEN - markerSize;
 
-                        size_t zstdResult = ZSTD_compress(
-                            compBuf.get() + markerSize,
-                            zstdBound,
-                            chunkBuf.get(),
-                            frag.m_nUncompressedSize,
-                            22 // example compression level
-                        );
+        size_t zstdResult = ZSTD_compress(
+            compBuf.get() + markerSize,
+            zstdBound,
+            chunkBuf.get(),
+            frag.m_nUncompressedSize,
+            22 // example compression level
+        );
 
-                        if (!ZSTD_isError(zstdResult))
-                        {
-                            size_t totalZstdSize = zstdResult + markerSize;
-                            if (totalZstdSize < frag.m_nUncompressedSize)
-                            {
-                                compressedOk = true;
-                                compSize = totalZstdSize;
-                            }
-                        }
-                    }
-                    else
-                    {
-                        // LZHAM path
-                        lzham_compress_status_t st = lzham_compress_memory(
-                            &builder.m_Encoder,
-                            compBuf.get(), &compSize,
-                            chunkBuf.get(), frag.m_nUncompressedSize,
-                            nullptr
-                        );
-                        if (st == LZHAM_COMP_STATUS_SUCCESS && compSize < frag.m_nUncompressedSize)
-                        {
-                            compressedOk = true;
-                        }
-                        else
-                        {
-                            compSize = frag.m_nUncompressedSize;
-                        }
-                    }
-                }
+        if (!ZSTD_isError(zstdResult))
+        {
+            size_t totalZstdSize = zstdResult + markerSize;
+            if (totalZstdSize < frag.m_nUncompressedSize)
+            {
+                compressedOk = true;
+                compSize = totalZstdSize;
+            }
+            else
+            {
+                std::cerr << "[ReVPK] ZSTD compression resulted in larger size, using uncompressed data\n";
+            }
+        }
+        else
+        {
+            std::cerr << "[ReVPK] ZSTD compression failed: " << ZSTD_getErrorName(zstdResult) << "\n";
+        }
+    }
+}
 
                 const uint8_t* finalPtr = compressedOk ? compBuf.get() : chunkBuf.get();
                 size_t finalSize = compressedOk ? compSize : frag.m_nUncompressedSize;
 
-                // Attempt chunk-level dedup
-                bool isDuplicate = false;
-                if (fileKV.m_bDeduplicate)
+                // --- Deduplication Logic ---
+                std::string chunkHash = compute_sha1_hex(finalPtr, finalSize);
+                auto it = builder.m_ChunkHashMap.find(chunkHash);
+                if (it != builder.m_ChunkHashMap.end())
                 {
-                    isDuplicate = builder.Deduplicate(finalPtr, frag, finalSize);
-                    if (isDuplicate)
-                    {
-                        sharedBytes += frag.m_nUncompressedSize;
-                        sharedChunks += 1;
-                    }
+                    // Existing chunk:
+                    frag = it->second;
+                    sharedBytes += frag.m_nUncompressedSize;
+                    sharedChunks++;
                 }
-
-                if (!isDuplicate)
+                else
                 {
+                    // New chunk:
                     // Physically write chunk
                     uint64_t writePos = static_cast<uint64_t>(ofsData.tellp());
                     frag.m_nPackFileOffset = writePos;
                     frag.m_nCompressedSize = finalSize;
                     ofsData.write(reinterpret_cast<const char*>(finalPtr), finalSize);
+
+                    // Store in map
+                    builder.m_ChunkHashMap[chunkHash] = frag;
                 }
-                // if duplicate, Deduplicate() overwrote `frag` with an existing offset
 
                 memoryOffset += frag.m_nUncompressedSize;
             } // each chunk
