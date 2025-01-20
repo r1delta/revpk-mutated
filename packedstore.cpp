@@ -272,7 +272,7 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
                         zstdBound,                    // dest capacity
                         chunkBuf.get(),               // src
                         frag.m_nUncompressedSize,     // src size
-                        22 /* or some default ZSTD level */
+                        6 /* or some default ZSTD level */
                     );
 
                     if (!ZSTD_isError(zstdResult))

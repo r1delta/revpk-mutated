@@ -345,7 +345,7 @@ if (fileKV.m_bUseCompression)
             zstdBound,
             chunkBuf.get(),
             frag.m_nUncompressedSize,
-            22 // example compression level
+            6 // example compression level
         );
 
         if (!ZSTD_isError(zstdResult))
