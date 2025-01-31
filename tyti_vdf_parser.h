@@ -1,854 +1,477 @@
-// MIT License
-//
-// Copyright(c) 2016 Matthias Moeller
-//
-// Permission is hereby granted, free of charge, to any person obtaining a copy
-// of this software and associated documentation files(the "Software"), to deal
-// in the Software without restriction, including without limitation the rights
-// to use, copy, modify, merge, publish, distribute, sublicense, and / or sell
-// copies of the Software, and to permit persons to whom the Software is
-// furnished to do so, subject to the following conditions :
-//
-// The above copyright notice and this permission notice shall be included in
-// all copies or substantial portions of the Software.
-//
-// THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
-// IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
-// FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT.IN NO EVENT SHALL THE
-// AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
-// LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
-// OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
-// SOFTWARE.
-
 #ifndef __TYTI_STEAM_VDF_PARSER_H__
 #define __TYTI_STEAM_VDF_PARSER_H__
 
-#include <algorithm>
-#include <fstream>
-#include <functional>
-#include <iterator>
-#include <map>
-#include <memory>
-#include <unordered_map>
-#include <unordered_set>
-#include <utility>
-#include <vector>
-
-#include <exception>
-#include <system_error>
-
-// for wstring support
-#include <cwchar>
 #include <string>
-
-// internal
-#include <stack>
-
-// VS < 2015 has only partial C++11 support
-#if defined(_MSC_VER) && _MSC_VER < 1900
-#ifndef CONSTEXPR
-#define CONSTEXPR
-#endif
-
-#ifndef NOEXCEPT
-#define NOEXCEPT
-#endif
-#else
-#ifndef CONSTEXPR
-#define CONSTEXPR constexpr
-#define TYTI_UNDEF_CONSTEXPR
-#endif
-
-#ifndef NOEXCEPT
-#define NOEXCEPT noexcept
-#define TYTI_UNDEF_NOEXCEPT
-#endif
-
-#endif
+#include <unordered_map>
+#include <memory>
+#include <fstream>
+#include <sstream>
+#include <vector>
+#include <stdexcept>
+#include <system_error>
 
 namespace tyti
 {
 namespace vdf
 {
-namespace detail
-{
-///////////////////////////////////////////////////////////////////////////
-//  Helper functions selecting the right encoding (char/wchar_T)
-///////////////////////////////////////////////////////////////////////////
 
-template <typename T> struct literal_macro_help
-{
-    static CONSTEXPR const char *result(const char *c, const wchar_t *) NOEXCEPT
-    {
-        return c;
-    }
-    static CONSTEXPR char result(const char c, const wchar_t) NOEXCEPT
-    {
-        return c;
-    }
-};
-
-template <> struct literal_macro_help<wchar_t>
-{
-    static CONSTEXPR const wchar_t *result(const char *,
-                                           const wchar_t *wc) NOEXCEPT
-    {
-        return wc;
-    }
-    static CONSTEXPR wchar_t result(const char, const wchar_t wc) NOEXCEPT
-    {
-        return wc;
-    }
-};
-#define TYTI_L(type, text)                                                     \
-    vdf::detail::literal_macro_help<type>::result(text, L##text)
-
-inline std::string string_converter(const std::string &w) NOEXCEPT { return w; }
-
-inline std::string string_converter(const std::wstring &w) NOEXCEPT
-{
-    std::mbstate_t state = std::mbstate_t();
-    auto wstr = w.data();
-// unsafe: ignores any error handling
-// and disables warning that wcsrtombs_s should be used
-#ifdef WIN32
-#pragma warning(push)
-#pragma warning(disable : 4996)
-#endif
-    std::size_t len = 1 + std::wcsrtombs(nullptr, &wstr, 0, &state);
-    std::string mbstr(len, '\0');
-    std::wcsrtombs(&mbstr[0], &wstr, mbstr.size(), &state);
-#ifdef WIN32
-#pragma warning(pop)
-#endif
-    return mbstr;
-}
-
-///////////////////////////////////////////////////////////////////////////
-//  Writer helper functions
-///////////////////////////////////////////////////////////////////////////
-
-template <typename charT> class tabs
-{
-    const size_t t;
-
-  public:
-    explicit CONSTEXPR tabs(size_t i) NOEXCEPT : t(i) {}
-    std::basic_string<charT> print() const
-    {
-        return std::basic_string<charT>(t, TYTI_L(charT, '\t'));
-    }
-    inline CONSTEXPR tabs operator+(size_t i) const NOEXCEPT
-    {
-        return tabs(t + i);
-    }
-};
-
-template <typename oStreamT>
-oStreamT &operator<<(oStreamT &s, const tabs<typename oStreamT::char_type> t)
-{
-    s << t.print();
-    return s;
-}
-
-template <typename charT>
-std::basic_string<charT> escape(std::basic_string<charT> in)
-{
-    // std::replace_if(in.begin(), end.begin(), [](const charT))
-    for (size_t i = 0; i < in.size(); ++i)
-    {
-        if (in[i] == TYTI_L(charT, '\"') || in[i] == TYTI_L(charT, '\\'))
-        {
-            in.insert(i, TYTI_L(charT, "\\"));
-            ++i;
-        }
-    }
-    return in;
-}
-
-} // end namespace detail
-
-///////////////////////////////////////////////////////////////////////////
-//  Interface
-///////////////////////////////////////////////////////////////////////////
-
-/// custom objects and their corresponding write functions
-
-/// basic object node. Every object has a name and can contains attributes saved
-/// as key_value pairs or childrens
-template <typename CharT> struct basic_object
-{
-    typedef CharT char_type;
-    std::basic_string<char_type> name;
-    std::unordered_map<std::basic_string<char_type>,
-                       std::basic_string<char_type>>
-        attribs;
-    std::unordered_map<std::basic_string<char_type>,
-                       std::shared_ptr<basic_object<char_type>>>
-        childs;
-
-    void add_attribute(std::basic_string<char_type> key,
-                       std::basic_string<char_type> value)
-    {
-        attribs.emplace(std::move(key), std::move(value));
-    }
-    void add_child(std::unique_ptr<basic_object<char_type>> child)
-    {
-        std::shared_ptr<basic_object<char_type>> obj{child.release()};
-        childs.emplace(obj->name, obj);
-    }
-    void set_name(std::basic_string<char_type> n) { name = std::move(n); }
-};
-
-template <typename CharT> struct basic_multikey_object
-{
-    typedef CharT char_type;
-    std::basic_string<char_type> name;
-    std::unordered_multimap<std::basic_string<char_type>,
-                            std::basic_string<char_type>>
-        attribs;
-    std::unordered_multimap<std::basic_string<char_type>,
-                            std::shared_ptr<basic_multikey_object<char_type>>>
-        childs;
-
-    void add_attribute(std::basic_string<char_type> key,
-                       std::basic_string<char_type> value)
-    {
-        attribs.emplace(std::move(key), std::move(value));
-    }
-    void add_child(std::unique_ptr<basic_multikey_object<char_type>> child)
-    {
-        std::shared_ptr<basic_multikey_object<char_type>> obj{child.release()};
-        childs.emplace(obj->name, obj);
-    }
-    void set_name(std::basic_string<char_type> n) { name = std::move(n); }
-};
-
-typedef basic_object<char> object;
-typedef basic_object<wchar_t> wobject;
-typedef basic_multikey_object<char> multikey_object;
-typedef basic_multikey_object<wchar_t> wmultikey_object;
-
+// Options struct, mostly a no-op in this CSV implementation.
 struct Options
 {
     bool strip_escape_symbols;
     bool ignore_all_platform_conditionals;
     bool ignore_includes;
-
     Options()
-        : strip_escape_symbols(true), ignore_all_platform_conditionals(false),
-          ignore_includes(false)
-    {
-    }
+        : strip_escape_symbols(true)
+        , ignore_all_platform_conditionals(false)
+        , ignore_includes(false)
+    {}
 };
 
+// WriteOptions struct, also mostly a no-op for CSV.
 struct WriteOptions
 {
     bool escape_symbols;
     WriteOptions() : escape_symbols(true) {}
 };
 
-// forward decls
-// forward decl
-template <typename OutputT, typename iStreamT>
-OutputT read(iStreamT &inStream, const Options &opt = Options{});
-
-/** \brief writes given object tree in vdf format to given stream.
-Output is prettyfied, using tabs
-*/
-template <typename oStreamT, typename T>
-void write(oStreamT &s, const T &r, const WriteOptions &opts = {},
-           const detail::tabs<typename oStreamT::char_type> tab =
-               detail::tabs<typename oStreamT::char_type>(0))
+// Basic object node. The interface remains the same, but we store CSV rows.
+template <typename CharT>
+struct basic_object
 {
-    typedef typename oStreamT::char_type charT;
-    using namespace detail;
-    auto escapeFunction = [&opts](const std::basic_string<charT> &in)
+    using char_type = CharT;
+    std::basic_string<char_type> name;
+    // For each node, we have key->value pairs:
+    std::unordered_map<std::basic_string<char_type>,
+                       std::basic_string<char_type>> attribs;
+    // And child nodes:
+    std::unordered_map<std::basic_string<char_type>,
+                       std::shared_ptr<basic_object<char_type>>> childs;
+
+    void add_attribute(std::basic_string<char_type> key,
+                       std::basic_string<char_type> value)
     {
-        if (opts.escape_symbols)
-            return escape(std::move(in));
-        return in;
-    };
+        attribs.emplace(std::move(key), std::move(value));
+    }
 
-    s << tab << TYTI_L(charT, '"') << escapeFunction(r.name)
-      << TYTI_L(charT, "\"\n") << tab << TYTI_L(charT, "{\n");
-    for (const auto &i : r.attribs)
-        s << tab + 1 << TYTI_L(charT, '"') << escapeFunction(i.first)
-          << TYTI_L(charT, "\"\t\t\"") << escapeFunction(i.second)
-          << TYTI_L(charT, "\"\n");
-    for (const auto &i : r.childs)
-        if (i.second)
-            write(s, *i.second, opts, tab + 1);
-    s << tab << TYTI_L(charT, "}\n");
-}
+    void add_child(std::unique_ptr<basic_object<char_type>> child)
+    {
+        std::shared_ptr<basic_object<char_type>> obj{child.release()};
+        childs.emplace(obj->name, obj);
+    }
 
-namespace detail
-{
+    void set_name(std::basic_string<char_type> n)
+    {
+        name = std::move(n);
+    }
+};
+
+using object = basic_object<char>;
+
+// -----------------------------------------------------------------------
+// Minimal CSV parse: 
+//   - We read the first line as headers. 
+//   - If there's a "lang" column, we treat the document as multi-language.
+//   - Otherwise, it's single-language. 
+//   - We store the CSV row data into child objects (or sub-child objects).
+//   - We hard-code "filePath" as the identifying column name for the child.
+// -----------------------------------------------------------------------
 template <typename iStreamT>
-std::basic_string<typename iStreamT::char_type> read_file(iStreamT &inStream)
+object read(iStreamT &inStream, const Options &opt = Options{})
 {
-    // cache the file
-    typedef typename iStreamT::char_type charT;
-    std::basic_string<charT> str;
-    inStream.seekg(0, std::ios::end);
-    str.resize(static_cast<size_t>(inStream.tellg()));
-    if (str.empty())
-        return str;
+    object root;
+    // For compatibility with code that checks doc.name == "BuildManifest":
+    root.name = "BuildManifest";
 
-    inStream.seekg(0, std::ios::beg);
-    inStream.read(&str[0], static_cast<std::streamsize>(str.size()));
-    return str;
-}
+    // 1) Read first line as CSV header
+    std::string headerLine;
+    if (!std::getline(inStream, headerLine))
+        return root; // empty file
 
-/** \brief Read VDF formatted sequences defined by the range [first, last).
-If the file is mailformatted, parser will try to read it until it can.
-@param first            begin iterator
-@param end              end iterator
-@param exclude_files    list of files which cant be included anymore.
-                        prevents circular includes
-
-can thow:
-        - "std::runtime_error" if a parsing error occured
-        - "std::bad_alloc" if not enough memory coup be allocated
-*/
-template <typename OutputT, typename IterT>
-std::vector<std::unique_ptr<OutputT>> read_internal(
-    IterT first, const IterT last,
-    std::unordered_set<
-        std::basic_string<typename std::iterator_traits<IterT>::value_type>>
-        &exclude_files,
-    const Options &opt)
-{
-    static_assert(std::is_default_constructible<OutputT>::value,
-                  "Output Type must be default constructible (provide "
-                  "constructor without arguments)");
-    static_assert(std::is_move_constructible<OutputT>::value,
-                  "Output Type must be move constructible");
-
-    typedef typename std::iterator_traits<IterT>::value_type charT;
-
-    const std::basic_string<charT> comment_end_str = TYTI_L(charT, "*/");
-    const std::basic_string<charT> whitespaces = TYTI_L(charT, " \n\v\f\r\t");
-
-#ifdef WIN32
-    std::function<bool(const std::basic_string<charT> &)> is_platform_str =
-        [](const std::basic_string<charT> &in)
+    std::vector<std::string> headers;
     {
-        return in == TYTI_L(charT, "$WIN32") || in == TYTI_L(charT, "$WINDOWS");
-    };
-#elif __APPLE__
-    // WIN32 stands for pc in general
-    std::function<bool(const std::basic_string<charT> &)> is_platform_str =
-        [](const std::basic_string<charT> &in)
+        std::stringstream ss(headerLine);
+        std::string col;
+        while (std::getline(ss, col, ','))
+            headers.push_back(col);
+    }
+
+    // 2) Find indices of "lang" and "filePath" if they exist
+    int langCol = -1;
+    int filePathCol = -1;
+    for (int i = 0; i < (int)headers.size(); i++)
     {
-        return in == TYTI_L(charT, "$WIN32") || in == TYTI_L(charT, "$POSIX") ||
-               in == TYTI_L(charT, "$OSX");
-    };
+        if (headers[i] == "lang")      langCol = i;
+        if (headers[i] == "filePath") filePathCol = i;
+    }
 
-#elif __linux__
-    // WIN32 stands for pc in general
-    std::function<bool(const std::basic_string<charT> &)> is_platform_str =
-        [](const std::basic_string<charT> &in)
+    // 3) Parse subsequent lines
+    std::string line;
+    while (std::getline(inStream, line))
     {
-        return in == TYTI_L(charT, "$WIN32") || in == TYTI_L(charT, "$POSIX") ||
-               in == TYTI_L(charT, "$LINUX");
-    };
-#else
-    std::function<bool(const std::basic_string<charT> &)> is_platform_str =
-        [](const std::basic_string<charT> &in) { return false; };
-#endif
+        if (line.empty()) continue;
 
-    if (opt.ignore_all_platform_conditionals)
-        is_platform_str = [](const std::basic_string<charT> &)
-        { return false; };
-
-    // function for skipping a comment block
-    // iter: iterator poition to the position after a '/'
-    auto skip_comments = [&comment_end_str](IterT iter,
-                                            const IterT &last) -> IterT
-    {
-        ++iter;
-        if (iter == last)
-            return last;
-
-        if (*iter == TYTI_L(charT, '/'))
+        // split by comma
+        std::vector<std::string> cols;
         {
-            // line comment, skip whole line
-            iter = std::find(iter + 1, last, TYTI_L(charT, '\n'));
-            if (iter == last)
-                return last;
+            std::stringstream ss(line);
+            std::string col;
+            while (std::getline(ss, col, ','))
+                cols.push_back(col);
         }
 
-        if (*iter == '*')
+        // skip if we don't even have filePath
+        if (filePathCol < 0 || filePathCol >= (int)cols.size())
+            continue;
+
+        const std::string &filePath = cols[filePathCol];
+
+        // 4) If there's a lang column, treat data as multiLang
+        if (langCol >= 0 && langCol < (int)cols.size())
         {
-            // block comment, skip until next occurance of "*\"
-            iter = std::search(iter + 1, last, std::begin(comment_end_str),
-                               std::end(comment_end_str));
-            if (std::distance(iter, last) <= 2)
-                return last;
-            iter += 2;
-        }
+            const std::string &language = cols[langCol];
 
-        return iter;
-    };
-
-    auto end_quote = [opt](IterT iter, const IterT &last) -> IterT
-    {
-        const auto begin = iter;
-        auto last_esc = iter;
-        if (iter == last)
-            throw std::runtime_error{"quote was opened but not closed."};
-        do
-        {
-            ++iter;
-            iter = std::find(iter, last, TYTI_L(charT, '\"'));
-            if (iter == last)
-                break;
-
-            last_esc = std::prev(iter);
-            if (opt.strip_escape_symbols)
+            // find or create the language child
+            auto langIt = root.childs.find(language);
+            if (langIt == root.childs.end())
             {
-                while (last_esc != begin && *last_esc == '\\')
-                    --last_esc;
+                std::unique_ptr<object> newLang(new object());
+                newLang->name = language;
+                root.add_child(std::move(newLang));
+                langIt = root.childs.find(language);
             }
-        } while (!(std::distance(last_esc, iter) % 2) && iter != last);
-        if (iter == last)
-            throw std::runtime_error{"quote was opened but not closed."};
-        return iter;
-    };
+            auto langObj = langIt->second.get();
 
-    auto end_word = [&whitespaces](IterT iter, const IterT &last) -> IterT
-    {
-        const auto begin = iter;
-        auto last_esc = iter;
-        if (iter == last)
-            throw std::runtime_error{"quote was opened but not closed."};
-        do
-        {
-            ++iter;
-            iter = std::find_first_of(iter, last, std::begin(whitespaces),
-                                      std::end(whitespaces));
-            if (iter == last)
-                break;
-
-            last_esc = std::prev(iter);
-            while (last_esc != begin && *last_esc == '\\')
-                --last_esc;
-        } while (!(std::distance(last_esc, iter) % 2) && iter != last);
-        if (iter == last)
-            throw std::runtime_error{"word wasnt properly ended"};
-        return iter;
-    };
-
-    auto skip_whitespaces = [&whitespaces](IterT iter,
-                                           const IterT &last) -> IterT
-    {
-        if (iter == last)
-            return iter;
-        iter = std::find_if_not(iter, last,
-                                [&whitespaces](charT c)
-                                {
-                                    // return true if whitespace
-                                    return std::any_of(std::begin(whitespaces),
-                                                       std::end(whitespaces),
-                                                       [c](charT pc)
-                                                       { return pc == c; });
-                                });
-        return iter;
-    };
-
-    std::function<void(std::basic_string<charT> &)> strip_escape_symbols =
-        [](std::basic_string<charT> &s)
-    {
-        auto quote_searcher = [&s](size_t pos)
-        { return s.find(TYTI_L(charT, "\\\""), pos); };
-        auto p = quote_searcher(0);
-        while (p != s.npos)
-        {
-            s.replace(p, 2, TYTI_L(charT, "\""));
-            p = quote_searcher(p + 1);
-        }
-        auto searcher = [&s](size_t pos)
-        { return s.find(TYTI_L(charT, "\\\\"), pos); };
-        p = searcher(0);
-        while (p != s.npos)
-        {
-            s.replace(p, 2, TYTI_L(charT, "\\"));
-            p = searcher(p + 1);
-        }
-    };
-
-    if (!opt.strip_escape_symbols)
-        strip_escape_symbols = [](std::basic_string<charT> &) {};
-
-    auto conditional_fullfilled =
-        [&skip_whitespaces, &is_platform_str](IterT &iter, const IterT &last)
-    {
-        iter = skip_whitespaces(iter, last);
-        if (iter == last)
-            return true;
-        if (*iter == '[')
-        {
-            ++iter;
-            if (iter == last)
-                throw std::runtime_error("conditional not closed");
-            const auto end = std::find(iter, last, ']');
-            if (end == last)
-                throw std::runtime_error("conditional not closed");
-            const bool negate = *iter == '!';
-            if (negate)
-                ++iter;
-            auto conditional = std::basic_string<charT>(iter, end);
-
-            const bool is_platform = is_platform_str(conditional);
-            iter = end + 1;
-
-            return static_cast<bool>(is_platform ^ negate);
-        }
-        return true;
-    };
-
-    // read header
-    //  first, quoted name
-    std::unique_ptr<OutputT> curObj = nullptr;
-    std::vector<std::unique_ptr<OutputT>> roots;
-    std::stack<std::unique_ptr<OutputT>> lvls;
-    auto curIter = first;
-
-    while (curIter != last && *curIter != '\0')
-    {
-        //  find first starting attrib/child, or ending
-        curIter = skip_whitespaces(curIter, last);
-        if (curIter == last || *curIter == '\0')
-            break;
-        if (*curIter == TYTI_L(charT, '/'))
-        {
-            curIter = skip_comments(curIter, last);
-            if (curIter == last || *curIter == '\0')
-                throw std::runtime_error("Unexpected eof");
-        }
-        else if (*curIter != TYTI_L(charT, '}'))
-        {
-            // get key
-            const auto keyEnd = (*curIter == TYTI_L(charT, '\"'))
-                                    ? end_quote(curIter, last)
-                                    : end_word(curIter, last);
-            if (*curIter == TYTI_L(charT, '\"'))
-                ++curIter;
-            std::basic_string<charT> key(curIter, keyEnd);
-            strip_escape_symbols(key);
-            curIter = keyEnd + ((*keyEnd == TYTI_L(charT, '\"')) ? 1 : 0);
-            if (curIter == last)
-                throw std::runtime_error{"key opened, but never closed"};
-
-            curIter = skip_whitespaces(curIter, last);
-
-            if (!conditional_fullfilled(curIter, last))
-                continue;
-            if (curIter == last)
-                throw std::runtime_error{"key declared, but no value"};
-
-            while (*curIter == TYTI_L(charT, '/'))
+            // find or create the filePath child
+            auto fIt = langObj->childs.find(filePath);
+            if (fIt == langObj->childs.end())
             {
-
-                curIter = skip_comments(curIter, last);
-                if (curIter == last || *curIter == '}')
-                    throw std::runtime_error{"key declared, but no value"};
-                curIter = skip_whitespaces(curIter, last);
-                if (curIter == last || *curIter == '}')
-                    throw std::runtime_error{"key declared, but no value"};
+                std::unique_ptr<object> newFile(new object());
+                newFile->name = filePath;
+                langObj->add_child(std::move(newFile));
+                fIt = langObj->childs.find(filePath);
             }
-            // get value
-            if (*curIter != '{')
+            auto fileObj = fIt->second.get();
+
+            // fill in attributes from all other columns
+            for (int i = 0; i < (int)cols.size(); i++)
             {
-                if (curIter == last)
-                    throw std::runtime_error{"key declared, but no value"};
-                const auto valueEnd = (*curIter == TYTI_L(charT, '\"'))
-                                          ? end_quote(curIter, last)
-                                          : end_word(curIter, last);
-                if (valueEnd == last)
-                    throw std::runtime_error("No closed word");
-                if (*curIter == TYTI_L(charT, '\"'))
-                    ++curIter;
-                if (curIter == last)
-                    throw std::runtime_error("No closed word");
-
-                auto value = std::basic_string<charT>(curIter, valueEnd);
-                strip_escape_symbols(value);
-                curIter =
-                    valueEnd + ((*valueEnd == TYTI_L(charT, '\"')) ? 1 : 0);
-
-                if (!conditional_fullfilled(curIter, last))
-                    continue;
-
-                // process value
-                if (key != TYTI_L(charT, "#include") &&
-                    key != TYTI_L(charT, "#base"))
-                {
-                    if (curObj)
-                    {
-                        curObj->add_attribute(std::move(key), std::move(value));
-                    }
-                    else
-                    {
-                        throw std::runtime_error{
-                            "unexpected key without object"};
-                    }
-                }
-                else
-                {
-                    if (!opt.ignore_includes &&
-                        exclude_files.find(value) == exclude_files.end())
-                    {
-                        exclude_files.insert(value);
-                        std::basic_ifstream<charT> i(
-                            detail::string_converter(value));
-                        auto str = read_file(i);
-                        auto file_objs = read_internal<OutputT>(
-                            str.begin(), str.end(), exclude_files, opt);
-                        for (auto &n : file_objs)
-                        {
-                            if (curObj)
-                                curObj->add_child(std::move(n));
-                            else
-                                roots.push_back(std::move(n));
-                        }
-                        exclude_files.erase(value);
-                    }
-                }
+                if (i == langCol || i == filePathCol) 
+                    continue; // skip these two "key" columns
+                if (i < (int)headers.size())
+                    fileObj->attribs[headers[i]] = cols[i];
             }
-            else if (*curIter == '{')
-            {
-                if (curObj)
-                    lvls.push(std::move(curObj));
-                curObj = std::make_unique<OutputT>();
-                curObj->set_name(std::move(key));
-                ++curIter;
-            }
-        }
-        // end of new object
-        else if (curObj && *curIter == TYTI_L(charT, '}'))
-        {
-            if (!lvls.empty())
-            {
-                // get object before
-                std::unique_ptr<OutputT> prev{std::move(lvls.top())};
-                lvls.pop();
-
-                // add finished obj to obj before and release it from processing
-                prev->add_child(std::move(curObj));
-                curObj = std::move(prev);
-            }
-            else
-            {
-                roots.push_back(std::move(curObj));
-                curObj.reset();
-            }
-            ++curIter;
         }
         else
         {
-            throw std::runtime_error{"unexpected '}'"};
+            // Single-language CSV
+            // find or create the filePath child
+            auto fIt = root.childs.find(filePath);
+            if (fIt == root.childs.end())
+            {
+                std::unique_ptr<object> newFile(new object());
+                newFile->name = filePath;
+                root.add_child(std::move(newFile));
+                fIt = root.childs.find(filePath);
+            }
+            auto fileObj = fIt->second.get();
+
+            // fill in attributes from all columns except filePath
+            for (int i = 0; i < (int)cols.size(); i++)
+            {
+                if (i == filePathCol) 
+                    continue;
+                if (i < (int)headers.size())
+                    fileObj->attribs[headers[i]] = cols[i];
+            }
         }
     }
-    if (curObj != nullptr || !lvls.empty())
-    {
-        throw std::runtime_error{"object is not closed with '}'"};
-    }
 
-    return roots;
+    return root;
 }
 
-} // namespace detail
-
-/** \brief Read VDF formatted sequences defined by the range [first, last).
-If the file is mailformatted, parser will try to read it until it can.
-@param first begin iterator
-@param end end iterator
-
-can thow:
-        - "std::runtime_error" if a parsing error occured
-        - "std::bad_alloc" if not enough memory coup be allocated
-*/
-template <typename OutputT, typename IterT>
-OutputT read(IterT first, const IterT last, const Options &opt = Options{})
-{
-    auto exclude_files = std::unordered_set<
-        std::basic_string<typename std::iterator_traits<IterT>::value_type>>{};
-    auto roots =
-        detail::read_internal<OutputT>(first, last, exclude_files, opt);
-
-    OutputT result;
-    if (roots.size() > 1)
-    {
-        for (auto &i : roots)
-            result.add_child(std::move(i));
-    }
-    else if (roots.size() == 1)
-        result = std::move(*roots[0]);
-
-    return result;
-}
-
-/** \brief Read VDF formatted sequences defined by the range [first, last).
-If the file is mailformatted, parser will try to read it until it can.
-@param first begin iterator
-@param end end iterator
-@param ec output bool. 0 if ok, otherwise, holds an system error code
-
-Possible error codes:
-std::errc::protocol_error: file is mailformatted
-std::errc::not_enough_memory: not enough space
-std::errc::invalid_argument: iterators throws e.g. out of range
-*/
-template <typename OutputT, typename IterT>
-OutputT read(IterT first, IterT last, std::error_code &ec,
-             const Options &opt = Options{}) NOEXCEPT
-
+// Overload that sets an error_code on failure; here it always "succeeds."
+template <typename iStreamT>
+object read(iStreamT &inStream, std::error_code &ec, const Options &opt = Options{})
 {
     ec.clear();
-    OutputT r{};
     try
     {
-        r = read<OutputT>(first, last, opt);
-    }
-    catch (std::runtime_error &)
-    {
-        ec = std::make_error_code(std::errc::protocol_error);
-    }
-    catch (std::bad_alloc &)
-    {
-        ec = std::make_error_code(std::errc::not_enough_memory);
+        return read(inStream, opt);
     }
     catch (...)
     {
         ec = std::make_error_code(std::errc::invalid_argument);
+        return object{};
     }
-    return r;
 }
 
-/** \brief Read VDF formatted sequences defined by the range [first, last).
-If the file is mailformatted, parser will try to read it until it can.
-@param first begin iterator
-@param end end iterator
-@param ok output bool. true, if parser successed, false, if parser failed
-*/
-template <typename OutputT, typename IterT>
-OutputT read(IterT first, const IterT last, bool *ok,
-             const Options &opt = Options{}) NOEXCEPT
-{
-    std::error_code ec;
-    auto r = read<OutputT>(first, last, ec, opt);
-    if (ok)
-        *ok = !ec;
-    return r;
-}
-
-template <typename IterT>
-inline auto read(IterT first, const IterT last, bool *ok,
-                 const Options &opt = Options{}) NOEXCEPT
-    -> basic_object<typename std::iterator_traits<IterT>::value_type>
-{
-    return read<basic_object<typename std::iterator_traits<IterT>::value_type>>(
-        first, last, ok, opt);
-}
-
-template <typename IterT>
-inline auto read(IterT first, IterT last, std::error_code &ec,
-                 const Options &opt = Options{}) NOEXCEPT
-    -> basic_object<typename std::iterator_traits<IterT>::value_type>
-{
-    return read<basic_object<typename std::iterator_traits<IterT>::value_type>>(
-        first, last, ec, opt);
-}
-
-template <typename IterT>
-inline auto read(IterT first, const IterT last, const Options &opt = Options{})
-    -> basic_object<typename std::iterator_traits<IterT>::value_type>
-{
-    return read<basic_object<typename std::iterator_traits<IterT>::value_type>>(
-        first, last, opt);
-}
-
-/** \brief Loads a stream (e.g. filestream) into the memory and parses the vdf
-   formatted data. throws "std::bad_alloc" if file buffer could not be allocated
-*/
-template <typename OutputT, typename iStreamT>
-OutputT read(iStreamT &inStream, std::error_code &ec,
-             const Options &opt = Options{})
-{
-    // cache the file
-    typedef typename iStreamT::char_type charT;
-    std::basic_string<charT> str = detail::read_file(inStream);
-
-    // parse it
-    return read<OutputT>(str.begin(), str.end(), ec, opt);
-}
-
+// Overload that sets a bool *ok. Again, always "succeeds" unless an exception.
 template <typename iStreamT>
-inline basic_object<typename iStreamT::char_type>
-read(iStreamT &inStream, std::error_code &ec, const Options &opt = Options{})
+object read(iStreamT &inStream, bool *ok, const Options &opt = Options{})
 {
-    return read<basic_object<typename iStreamT::char_type>>(inStream, ec, opt);
+    if (ok) *ok = true;
+    try
+    {
+        return read(inStream, opt);
+    }
+    catch (...)
+    {
+        if (ok) *ok = false;
+        return object{};
+    }
 }
 
-/** \brief Loads a stream (e.g. filestream) into the memory and parses the vdf
-   formatted data. throws "std::bad_alloc" if file buffer could not be allocated
-    ok == false, if a parsing error occured
-*/
+// Write a CSV. We check if root has second-level children (meaning multiLang).
+template <typename oStreamT>
+void write(oStreamT &os, const object &root, const WriteOptions &wopt = WriteOptions{})
+{
+    // 1) Determine if multiLang: if root.childs[...] has its own children
+    bool isMultiLang = false;
+    for (auto &childPair : root.childs)
+    {
+        if (!childPair.second->childs.empty())
+        {
+            isMultiLang = true;
+            break;
+        }
+    }
+
+    // 2) Collect all attribute names from every file object
+    // If multiLang, we look under each language->file
+    // If single, we look under root->file
+    std::vector<std::string> columns;
+    if (isMultiLang)
+    {
+        columns.push_back("lang");
+        columns.push_back("filePath");
+    }
+    else
+    {
+        columns.push_back("filePath");
+    }
+
+    // Gather attribute keys
+    std::unordered_map<std::string, bool> attrMap;
+    if (isMultiLang)
+    {
+        for (auto &langPair : root.childs)
+        {
+            auto langObj = langPair.second.get();
+            for (auto &filePair : langObj->childs)
+            {
+                auto fileObj = filePair.second.get();
+                for (auto &attribPair : fileObj->attribs)
+                    attrMap[attribPair.first] = true;
+            }
+        }
+    }
+    else
+    {
+        for (auto &filePair : root.childs)
+        {
+            auto fileObj = filePair.second.get();
+            for (auto &attribPair : fileObj->attribs)
+                attrMap[attribPair.first] = true;
+        }
+    }
+
+    // Add those attributes to columns
+    for (auto &am : attrMap)
+        columns.push_back(am.first);
+
+    // 3) Write the CSV header
+    for (size_t i = 0; i < columns.size(); i++)
+    {
+        os << columns[i];
+        if (i + 1 < columns.size())
+            os << ",";
+    }
+    os << "\n";
+
+    // 4) Write each row
+    if (isMultiLang)
+    {
+        // We have "lang" -> "filePath" -> attributes
+        for (auto &langPair : root.childs)
+        {
+            const std::string &lang = langPair.first;
+            auto langObj = langPair.second.get();
+
+            for (auto &filePair : langObj->childs)
+            {
+                const std::string &filePath = filePair.first;
+                auto fileObj = filePair.second.get();
+
+                // build a row of columns.size() columns
+                std::vector<std::string> row(columns.size(), "");
+                row[0] = lang;
+                row[1] = filePath;
+
+                // fill attributes
+                for (size_t c = 2; c < columns.size(); c++)
+                {
+                    auto it = fileObj->attribs.find(columns[c]);
+                    if (it != fileObj->attribs.end())
+                        row[c] = it->second;
+                }
+
+                // write out row
+                for (size_t c = 0; c < row.size(); c++)
+                {
+                    os << row[c];
+                    if (c + 1 < row.size())
+                        os << ",";
+                }
+                os << "\n";
+            }
+        }
+    }
+    else
+    {
+        // Single language: root -> file
+        for (auto &filePair : root.childs)
+        {
+            const std::string &filePath = filePair.first;
+            auto fileObj = filePair.second.get();
+
+            std::vector<std::string> row(columns.size(), "");
+            row[0] = filePath;
+
+            // fill attributes
+            for (size_t c = 1; c < columns.size(); c++)
+            {
+                auto it = fileObj->attribs.find(columns[c]);
+                if (it != fileObj->attribs.end())
+                    row[c] = it->second;
+            }
+
+            for (size_t c = 0; c < row.size(); c++)
+            {
+                os << row[c];
+                if (c + 1 < row.size())
+                    os << ",";
+            }
+            os << "\n";
+        }
+    }
+}
+
+// Overload that takes an output type AND a stream type, e.g. read<tyti::vdf::object>(std::ifstream, ...)
 template <typename OutputT, typename iStreamT>
-OutputT read(iStreamT &inStream, bool *ok, const Options &opt = Options{})
+OutputT read(iStreamT &inStream, const Options &opt = Options{})
 {
-    std::error_code ec;
-    const auto r = read<OutputT>(inStream, ec, opt);
-    if (ok)
-        *ok = !ec;
-    return r;
+    // For CSV, we always parse into a basic_object<char> shape
+    // then return it as the OutputT. Typically, OutputT == basic_object<char>.
+    // 1) Create an empty object of the expected type
+    OutputT root;
+    root.name = "BuildManifest"; // or let parse overwrite if you prefer
+
+    // 2) Actually read lines from the stream
+    std::string headerLine;
+    if (!std::getline(inStream, headerLine))
+        return root; // empty file => empty object
+
+    // CSV parsing for the first row as headers
+    std::vector<std::string> headers;
+    {
+        std::stringstream ss(headerLine);
+        std::string col;
+        while (std::getline(ss, col, ','))
+            headers.push_back(col);
+    }
+
+    // detect if we have "lang" or not
+    int langCol = -1;
+    int filePathCol = -1;
+    for (int i = 0; i < (int)headers.size(); ++i)
+    {
+        if (headers[i] == "lang")      langCol = i;
+        if (headers[i] == "filePath") filePathCol = i;
+    }
+
+    // read each subsequent CSV row
+    std::string line;
+    while (std::getline(inStream, line))
+    {
+        if (line.empty()) continue;
+        std::vector<std::string> cols;
+
+        {
+            std::stringstream ss(line);
+            std::string col;
+            while (std::getline(ss, col, ','))
+                cols.push_back(col);
+        }
+
+        // skip if we don't have a valid filePath column
+        if (filePathCol < 0 || filePathCol >= (int)cols.size())
+            continue;
+        std::string filePath = cols[filePathCol];
+
+        if (langCol >= 0 && langCol < (int)cols.size())
+        {
+            // multi-language mode
+            std::string lang = cols[langCol];
+
+            // find or create language child
+            auto langIt = root.childs.find(lang);
+            if (langIt == root.childs.end())
+            {
+                auto newLang = std::make_unique<OutputT>();
+                newLang->name = lang;
+                root.add_child(std::move(newLang));
+                langIt = root.childs.find(lang);
+            }
+            auto langObj = langIt->second.get();
+
+            // find or create the file child
+            auto fileIt = langObj->childs.find(filePath);
+            if (fileIt == langObj->childs.end())
+            {
+                auto newFile = std::make_unique<OutputT>();
+                newFile->name = filePath;
+                langObj->add_child(std::move(newFile));
+                fileIt = langObj->childs.find(filePath);
+            }
+            auto fileObj = fileIt->second.get();
+
+            // fill attributes from other columns
+            for (int i = 0; i < (int)cols.size(); i++)
+            {
+                if (i == langCol || i == filePathCol) continue;
+                if (i < (int)headers.size())
+                    fileObj->attribs[headers[i]] = cols[i];
+            }
+        }
+        else
+        {
+            // single-language mode
+            auto fileIt = root.childs.find(filePath);
+            if (fileIt == root.childs.end())
+            {
+                auto newFile = std::make_unique<OutputT>();
+                newFile->name = filePath;
+                root.add_child(std::move(newFile));
+                fileIt = root.childs.find(filePath);
+            }
+            auto fileObj = fileIt->second.get();
+
+            // fill attributes
+            for (int i = 0; i < (int)cols.size(); i++)
+            {
+                if (i == filePathCol) continue;
+                if (i < (int)headers.size())
+                    fileObj->attribs[headers[i]] = cols[i];
+            }
+        }
+    }
+
+    return root;
 }
 
-template <typename iStreamT>
-inline basic_object<typename iStreamT::char_type>
-read(iStreamT &inStream, bool *ok, const Options &opt = Options{})
-{
-    return read<basic_object<typename iStreamT::char_type>>(inStream, ok, opt);
-}
-
-/** \brief Loads a stream (e.g. filestream) into the memory and parses the vdf
-   formatted data. throws "std::bad_alloc" if file buffer could not be allocated
-    throws "std::runtime_error" if a parsing error occured
-*/
-template <typename OutputT, typename iStreamT>
-OutputT read(iStreamT &inStream, const Options &opt)
-{
-
-    // cache the file
-    typedef typename iStreamT::char_type charT;
-    std::basic_string<charT> str = detail::read_file(inStream);
-    // parse it
-    return read<OutputT>(str.begin(), str.end(), opt);
-}
-
-template <typename iStreamT>
-inline basic_object<typename iStreamT::char_type>
-read(iStreamT &inStream, const Options &opt = Options{})
-{
-    return read<basic_object<typename iStreamT::char_type>>(inStream, opt);
-}
 
 } // namespace vdf
 } // namespace tyti
-#ifndef TYTI_NO_L_UNDEF
-#undef TYTI_L
-#endif
 
-#ifdef TYTI_UNDEF_CONSTEXPR
-#undef CONSTEXPR
-#undef TYTI_NO_L_UNDEF
-#endif
-
-#ifdef TYTI_UNDEF_NOTHROW
-#undef NOTHROW
-#undef TYTI_UNDEF_NOTHROW
-#endif
-
-#endif //__TYTI_STEAM_VDF_PARSER_H__
+#endif // __TYTI_STEAM_VDF_PARSER_H__

@@ -10,6 +10,12 @@
 #include <iostream>
 #include <cstring>
 #include <cassert>
+#include <thread>
+#include <mutex>
+#include <queue>
+#include <condition_variable>
+#include <functional>
+#include <atomic>
 
 // OpenSSL for SHA
 #include <openssl/sha.h>
@@ -76,12 +82,20 @@ VPKEntryBlock_t::VPKEntryBlock_t(const uint8_t* pData, size_t nLen, uint64_t /*n
     m_iPreloadSize = iPreloadSize;
     m_iPackFileIndex = iPackFileIndex;
     m_EntryPath = (pEntryPath ? pEntryPath : "");
+    m_PreloadData.clear();
 
-    // compute CRC
+    // compute CRC on entire file
     m_nFileCRC = compute_crc32(pData, nLen);
 
-    // break file into 1 MiB chunks
-    size_t totalLeft = nLen;
+    // handle preload data
+    if (iPreloadSize > 0 && iPreloadSize <= nLen) {
+        m_PreloadData.resize(iPreloadSize);
+        std::memcpy(m_PreloadData.data(), pData, iPreloadSize);
+    }
+
+    // break remaining data into 1 MiB chunks
+    size_t totalLeft = (nLen > iPreloadSize) ? nLen - iPreloadSize : 0;
+    const uint8_t* pFragmentData = (nLen > iPreloadSize) ? pData + iPreloadSize : nullptr;
     size_t currentMemOffset = 0;  // Track memory offset instead of pack offset
     const size_t chunkSz = VPK_ENTRY_MAX_LEN;
 
@@ -124,11 +138,23 @@ void CPackedStoreBuilder::InitLzEncoder(int maxHelperThreads, const char* compre
 
 void CPackedStoreBuilder::InitLzDecoder()
 {
-    std::memset(&m_Decoder, 0, sizeof(m_Decoder));
-    m_Decoder.m_struct_size     = sizeof(m_Decoder);
-    m_Decoder.m_dict_size_log2  = VPK_DICT_SIZE;
-    m_Decoder.m_decompress_flags= LZHAM_DECOMP_FLAG_OUTPUT_UNBUFFERED;
+    // Prepare the decompression parameters.
+    lzham_decompress_params dec_params;
+    std::memset(&dec_params, 0, sizeof(dec_params));
+    dec_params.m_struct_size       = sizeof(dec_params);
+    dec_params.m_dict_size_log2    = VPK_DICT_SIZE;  // defined elsewhere (e.g. 20 for 1 MB dictionary)
+    dec_params.m_decompress_flags  = LZHAM_DECOMP_FLAG_OUTPUT_UNBUFFERED;
+    // (Other fields such as m_cpucache_total_lines and m_cpucache_line_size can be left at 0)
+
+    // Call the official LZHAM decoder initialization function.
+    lzham_decompress_state_ptr decoder_state = lzham_decompress_init(&dec_params);
+    if (decoder_state == nullptr)
+    {
+        std::cerr << "[ReVPK] ERROR: Failed to initialize LZHAM decoder." << std::endl;
+        // You might want to handle the error (throw, exit, etc.)
+    }
 }
+
 
 // ------------------------------------------------------------------------
 //  Deduplicate chunk
@@ -357,27 +383,100 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
 
     m_ChunkHashMap.clear();
 }
+// --------------------
+// Simple thread pool class
+// --------------------
+class ThreadPool {
+public:
+    ThreadPool(size_t numThreads)
+        : stop(false), tasksInProgress(0)
+    {
+        for (size_t i = 0; i < numThreads; i++)
+        {
+            workers.emplace_back([this](){
+                while (true)
+                {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lock(queueMutex);
+                        condition.wait(lock, [this](){ return stop || !tasks.empty(); });
+                        if (stop && tasks.empty())
+                            return;
+                        task = std::move(tasks.front());
+                        tasks.pop();
+                        tasksInProgress++;
+                    }
+                    task();
+                    tasksInProgress--;
+                    waitCondition.notify_all();
+                }
+            });
+        }
+    }
+
+    ~ThreadPool()
+    {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            stop = true;
+        }
+        condition.notify_all();
+        for (std::thread &worker : workers)
+            worker.join();
+    }
+
+    // Enqueue a task into the pool.
+    void enqueue(std::function<void()> task)
+    {
+        {
+            std::unique_lock<std::mutex> lock(queueMutex);
+            tasks.push(std::move(task));
+        }
+        condition.notify_one();
+    }
+
+    // Block until all tasks have completed.
+    void wait()
+    {
+        std::unique_lock<std::mutex> lock(waitMutex);
+        waitCondition.wait(lock, [this](){
+            std::unique_lock<std::mutex> lock(queueMutex);
+            return tasks.empty() && tasksInProgress.load() == 0;
+        });
+    }
+
+private:
+    std::vector<std::thread> workers;
+    std::queue<std::function<void()>> tasks;
+    std::mutex queueMutex;
+    std::condition_variable condition;
+    bool stop;
+
+    std::mutex waitMutex;
+    std::condition_variable waitCondition;
+    std::atomic<int> tasksInProgress;
+};
 
 // ------------------------------------------------------------------------
-//  CPackedStoreBuilder::UnpackStore
+//  Modified CPackedStoreBuilder::UnpackStore (threaded version)
 // ------------------------------------------------------------------------
 void CPackedStoreBuilder::UnpackStore(const VPKDir_t& vpkDir, const char* workspaceName)
 {
     namespace fs = std::filesystem;
     fs::path outPath = (workspaceName ? workspaceName : "");
     if (!outPath.empty())
-    {
         fs::create_directories(outPath);
-    }
 
-    // Also rebuild a manifest from the directory
+    // Create directory for manifest and build CSV manifest (unchanged)
     std::string baseName = PackedStore_GetDirBaseName(vpkDir.m_DirFilePath);
     fs::path manifestDir = outPath / "manifest";
     fs::create_directories(manifestDir);
-    fs::path manifestPath = manifestDir / (baseName + ".vdf");
+    fs::path manifestPath = manifestDir / (baseName + ".vdf"); 
 
-    // Build manifest lines
-    std::ostringstream oss;
+    // -----------------------------
+    // Build the manifest (CSV/VDF) document:
+    tyti::vdf::object doc;
+    doc.name = "BuildManifest";
     for (auto& blk : vpkDir.m_EntryBlocks)
     {
         bool compressed = false;
@@ -389,22 +488,21 @@ void CPackedStoreBuilder::UnpackStore(const VPKDir_t& vpkDir, const char* worksp
                 break;
             }
         }
-        oss << "\"" << blk.m_EntryPath << "\"\n"
-        << "{\n"
-        << "  \"preloadSize\" \"" << blk.m_iPreloadSize << "\"\n"
-        << "  \"loadFlags\" \""   << (blk.m_Fragments.empty()? 3 : blk.m_Fragments[0].m_nLoadFlags) << "\"\n"
-        << "  \"textureFlags\" \""<< (blk.m_Fragments.empty()? 0 : blk.m_Fragments[0].m_nTextureFlags) << "\"\n"
-        << "  \"useCompression\" \"" << (compressed ? "1" : "0") << "\"\n"
-        << "  \"deDuplicate\" \"1\"\n"
-        << "}\n\n";
+        auto fileObj = std::make_unique<tyti::vdf::object>();
+        fileObj->name = blk.m_EntryPath;
+        fileObj->attribs["preloadSize"]    = std::to_string(blk.m_iPreloadSize);
+        fileObj->attribs["loadFlags"]      = std::to_string(blk.m_Fragments.empty() ? 3 : blk.m_Fragments[0].m_nLoadFlags);
+        fileObj->attribs["textureFlags"]   = std::to_string(blk.m_Fragments.empty() ? 0 : blk.m_Fragments[0].m_nTextureFlags);
+        fileObj->attribs["useCompression"] = compressed ? "1" : "0";
+        fileObj->attribs["deDuplicate"]    = "1";
+        doc.add_child(std::move(fileObj));
     }
     {
         std::ofstream ofs(manifestPath);
         if (ofs.is_open())
         {
-            ofs << "\"BuildManifest\"\n{\n";
-            ofs << oss.str();
-            ofs << "}\n";
+            tyti::vdf::WriteOptions wopt;
+            tyti::vdf::write(ofs, doc, wopt);
         }
         else
         {
@@ -412,79 +510,79 @@ void CPackedStoreBuilder::UnpackStore(const VPKDir_t& vpkDir, const char* worksp
         }
     }
 
-    // 2) Extract
-    std::unique_ptr<uint8_t[]> srcBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
-    std::unique_ptr<uint8_t[]> dstBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+    // -----------------------------
+    // Multi-threaded extraction
+    // -----------------------------
+    unsigned int numThreads = std::max(1u, std::thread::hardware_concurrency() - 1);
+    ThreadPool pool(numThreads);
 
-    fs::path baseDir = fs::path(vpkDir.m_DirFilePath).parent_path();
-    for (auto idx : vpkDir.m_PakFileIndices)
+    // For each file block, enqueue an extraction task.
+    for (const auto& block : vpkDir.m_EntryBlocks)
     {
-        std::string chunkName = vpkDir.GetPackFileNameForIndex(idx);
-        fs::path chunkPath = baseDir / chunkName;
+        pool.enqueue([block, outPath, &vpkDir, this]() {
+            namespace fs = std::filesystem;
+            // Determine the pack file for this block.
+            std::string packFileName = vpkDir.GetPackFileNameForIndex(block.m_iPackFileIndex);
+            fs::path baseDir = fs::path(vpkDir.m_DirFilePath).parent_path();
+            fs::path chunkPath = baseDir / packFileName;
 
-        std::ifstream ifs(chunkPath, std::ios::binary);
-        if (!ifs.good())
-        {
-            std::cerr << "[ReVPK] ERROR: Could not open chunk file: " << chunkPath << "\n";
-            continue;
-        }
+            std::ifstream ifs(chunkPath, std::ios::binary);
+            if (!ifs.good())
+            {
+                std::cerr << "[ReVPK] ERROR: Could not open chunk file: " << chunkPath << "\n";
+                return;
+            }
 
-        for (auto& block : vpkDir.m_EntryBlocks)
-        {
-            if (block.m_iPackFileIndex != idx)
-                continue;
-
-            // create subdirs
+            // Create output directories and file.
             fs::path outFile = outPath / block.m_EntryPath;
             fs::create_directories(outFile.parent_path());
             std::ofstream ofs(outFile, std::ios::binary);
             if (!ofs.is_open())
             {
                 std::cerr << "[ReVPK] ERROR: Could not open output file for writing: " << outFile << "\n";
-                continue;
+                return;
             }
 
-            // read chunk by chunk
+            // Write preload data first if present
+            if (!block.m_PreloadData.empty()) {
+                ofs.write(reinterpret_cast<const char*>(block.m_PreloadData.data()), block.m_PreloadData.size());
+            }
+
+            // Allocate per-task buffers.
+            std::unique_ptr<uint8_t[]> srcBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+            std::unique_ptr<uint8_t[]> dstBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+
+            // Process each fragment in the block.
             for (auto& frag : block.m_Fragments)
             {
                 if (frag.m_nPackFileOffset == 0 && frag.m_nCompressedSize == 0)
-                    continue; // deduplicated chunk might refer to offset in another pack file
+                    continue; // skip deduplicated chunk
+
                 ifs.seekg(frag.m_nPackFileOffset, std::ios::beg);
-                if (!ifs.good()) break;
+                if (!ifs.good())
+                    break;
 
                 ifs.read(reinterpret_cast<char*>(srcBuf.get()), frag.m_nCompressedSize);
 
-                // --- ZSTD support ---
+                // If the chunk is not compressed…
                 if (frag.m_nCompressedSize == frag.m_nUncompressedSize)
                 {
-                    // Uncompressed
                     ofs.write(reinterpret_cast<const char*>(srcBuf.get()), frag.m_nUncompressedSize);
                 }
                 else
                 {
-                    // Potentially compressed. Let's see if it’s ZSTD:
+                    // Check for ZSTD marker.
                     if (frag.m_nCompressedSize >= sizeof(R1D_marker))
                     {
                         uint64_t possibleMarker = 0;
                         std::memcpy(&possibleMarker, srcBuf.get(), sizeof(R1D_marker));
-
                         if (possibleMarker == R1D_marker)
                         {
-                            // -------------------------
-                            // ZSTD chunk
-                            // -------------------------
-                            // Data after the marker:
-                            const uint8_t* zstdData = srcBuf.get() + sizeof(R1D_marker);
-                            size_t zstdSize        = frag.m_nCompressedSize - sizeof(R1D_marker);
-
-                            // Decompress into dstBuf
-                            size_t dstLen = VPK_ENTRY_MAX_LEN;  // max chunk size
-                            size_t dResult = ZSTD_decompress(
-                                dstBuf.get(),
-                                                             dstLen,
-                                                             zstdData,
-                                                             zstdSize
-                            );
+                            constexpr size_t markerSize = sizeof(R1D_marker);
+                            const uint8_t* zstdData = srcBuf.get() + markerSize;
+                            size_t zstdSize = frag.m_nCompressedSize - markerSize;
+                            size_t dstLen = VPK_ENTRY_MAX_LEN;
+                            size_t dResult = ZSTD_decompress(dstBuf.get(), dstLen, zstdData, zstdSize);
                             if (!ZSTD_isError(dResult))
                             {
                                 ofs.write(reinterpret_cast<const char*>(dstBuf.get()), dResult);
@@ -496,18 +594,18 @@ void CPackedStoreBuilder::UnpackStore(const VPKDir_t& vpkDir, const char* worksp
                             continue;
                         }
                     }
-
-                    // -------------------------
-                    // If we reach here, assume LZHAM
-                    // -------------------------
+                    // For LZHAM, make a local copy of the decoder state for thread safety.
+                    lzham_decompress_params local_params;
+                    std::memset(&local_params, 0, sizeof(local_params));
+                    local_params.m_struct_size = sizeof(local_params);
+                    local_params.m_dict_size_log2 = VPK_DICT_SIZE;
                     size_t dstLen = VPK_ENTRY_MAX_LEN;
                     lzham_decompress_status_t st = lzham_decompress_memory(
-                        &m_Decoder,
+                        &local_params,
                         dstBuf.get(), &dstLen,
-                                                                           srcBuf.get(), static_cast<size_t>(frag.m_nCompressedSize),
-                                                                           nullptr
+                        srcBuf.get(), static_cast<size_t>(frag.m_nCompressedSize),
+                        nullptr
                     );
-
                     if (st != LZHAM_DECOMP_STATUS_SUCCESS)
                     {
                         std::cerr << "[ReVPK] ERROR decompressing LZHAM chunk.\n";
@@ -517,10 +615,141 @@ void CPackedStoreBuilder::UnpackStore(const VPKDir_t& vpkDir, const char* worksp
                         ofs.write(reinterpret_cast<const char*>(dstBuf.get()), dstLen);
                     }
                 }
-                // --------------------
-            }
-        }
+            } // end per-fragment loop
+        });
     }
+    pool.wait(); // Wait until all extraction tasks are complete.
+}
+
+// ------------------------------------------------------------------------
+//  Modified CPackedStoreBuilder::UnpackStoreDifferences (threaded version)
+// ------------------------------------------------------------------------
+void CPackedStoreBuilder::UnpackStoreDifferences(
+    const VPKDir_t& fallbackDir,     // Typically English
+    const VPKDir_t& otherLangDir,    // Current language
+    const std::string& fallbackOutputPath, // e.g. outPath/content/english/
+    const std::string& langOutputPath      // e.g. outPath/content/spanish/
+)
+{
+    namespace fs = std::filesystem;
+
+    // Build a map from entry path to file CRC for the fallback language.
+    std::unordered_map<std::string, uint32_t> fallbackCrcMap;
+    for (auto& fbBlock : fallbackDir.m_EntryBlocks)
+    {
+        fallbackCrcMap[fbBlock.m_EntryPath] = fbBlock.m_nFileCRC;
+    }
+
+    unsigned int numThreads = std::max(1u, std::thread::hardware_concurrency() - 1);
+    ThreadPool pool(numThreads);
+
+    fs::path baseDir = fs::path(otherLangDir.m_DirFilePath).parent_path();
+
+    // For each file block in the other language...
+    for (auto& block : otherLangDir.m_EntryBlocks)
+    {
+        auto itCrc = fallbackCrcMap.find(block.m_EntryPath);
+        bool sameAsFallback = (itCrc != fallbackCrcMap.end() && itCrc->second == block.m_nFileCRC);
+
+        // Skip extraction if the fallback file is identical.
+        if (sameAsFallback)
+            continue;
+
+        // Enqueue a task to extract this file.
+        pool.enqueue([block, &otherLangDir, baseDir, langOutputPath, this]() {
+            namespace fs = std::filesystem;
+            std::string packFileName = otherLangDir.GetPackFileNameForIndex(block.m_iPackFileIndex);
+            fs::path fullPakPath = baseDir / packFileName;
+
+            std::ifstream ifsPak(fullPakPath, std::ios::binary);
+            if (!ifsPak.good())
+            {
+                std::cerr << "[ReVPK] ERROR: cannot open " << fullPakPath << " for reading\n";
+                return;
+            }
+
+            fs::path outFile = fs::path(langOutputPath) / block.m_EntryPath;
+            fs::create_directories(outFile.parent_path());
+            std::ofstream ofsOut(outFile, std::ios::binary);
+            if (!ofsOut.is_open())
+            {
+                std::cerr << "[ReVPK] ERROR: cannot create " << outFile << "\n";
+                return;
+            }
+
+            // Write preload data first if present
+            if (!block.m_PreloadData.empty()) {
+                ofsOut.write(reinterpret_cast<const char*>(block.m_PreloadData.data()), block.m_PreloadData.size());
+            }
+
+            std::unique_ptr<uint8_t[]> srcBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+            std::unique_ptr<uint8_t[]> dstBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
+
+            for (auto& frag : block.m_Fragments)
+            {
+                if (frag.m_nPackFileOffset == 0 && frag.m_nCompressedSize == 0)
+                    continue;
+
+                ifsPak.seekg(frag.m_nPackFileOffset, std::ios::beg);
+                if (!ifsPak.good())
+                {
+                    std::cerr << "[ReVPK] ERROR: Bad seek in " << fullPakPath << "\n";
+                    break;
+                }
+
+                ifsPak.read(reinterpret_cast<char*>(srcBuf.get()), frag.m_nCompressedSize);
+
+                if (frag.m_nCompressedSize == frag.m_nUncompressedSize)
+                {
+                    ofsOut.write(reinterpret_cast<const char*>(srcBuf.get()), frag.m_nUncompressedSize);
+                }
+                else
+                {
+                    if (frag.m_nCompressedSize >= sizeof(R1D_marker))
+                    {
+                        uint64_t possibleMarker = 0;
+                        std::memcpy(&possibleMarker, srcBuf.get(), sizeof(R1D_marker));
+                        if (possibleMarker == R1D_marker)
+                        {
+                            size_t zstdSize = frag.m_nCompressedSize - sizeof(R1D_marker);
+                            const uint8_t* zstdData = srcBuf.get() + sizeof(R1D_marker);
+                            size_t dstLen = VPK_ENTRY_MAX_LEN;
+                            size_t dRes = ZSTD_decompress(dstBuf.get(), dstLen, zstdData, zstdSize);
+                            if (!ZSTD_isError(dRes))
+                            {
+                                ofsOut.write(reinterpret_cast<const char*>(dstBuf.get()), dRes);
+                            }
+                            else
+                            {
+                                std::cerr << "[ReVPK] ERROR: ZSTD decompress failed.\n";
+                            }
+                            continue;
+                        }
+                    }
+                    lzham_decompress_params local_params;
+                    std::memset(&local_params, 0, sizeof(local_params));
+                    local_params.m_struct_size = sizeof(local_params);
+                    local_params.m_dict_size_log2 = VPK_DICT_SIZE;
+                    size_t dstLen = VPK_ENTRY_MAX_LEN;
+                    lzham_decompress_status_t st = lzham_decompress_memory(
+                        &local_params,
+                        dstBuf.get(), &dstLen,
+                        srcBuf.get(), static_cast<size_t>(frag.m_nCompressedSize),
+                        nullptr
+                    );
+                    if (st == LZHAM_DECOMP_STATUS_SUCCESS)
+                    {
+                        ofsOut.write(reinterpret_cast<const char*>(dstBuf.get()), dstLen);
+                    }
+                    else
+                    {
+                        std::cerr << "[ReVPK] ERROR: LZHAM decompress failed.\n";
+                    }
+                }
+            } // end per-fragment loop
+        });
+    }
+    pool.wait(); // Wait for all tasks to finish.
 }
 
 // ------------------------------------------------------------------------
@@ -665,6 +894,12 @@ void VPKDir_t::Init(const std::string& dirFilePath)
                 ifs.read(reinterpret_cast<char*>(&block.m_nFileCRC),       sizeof(block.m_nFileCRC));
                 ifs.read(reinterpret_cast<char*>(&block.m_iPreloadSize),   sizeof(block.m_iPreloadSize));
                 ifs.read(reinterpret_cast<char*>(&block.m_iPackFileIndex), sizeof(block.m_iPackFileIndex));
+
+                // Read preload data if present
+                if (block.m_iPreloadSize > 0) {
+                    block.m_PreloadData.resize(block.m_iPreloadSize);
+                    ifs.read(reinterpret_cast<char*>(block.m_PreloadData.data()), block.m_iPreloadSize);
+                }
 
                 // Now read chunk descriptors until we hit PACKFILEINDEX_END
                 while (true)
@@ -938,150 +1173,6 @@ std::string PackedStore_GetDirBaseName(const std::string& dirFileName)
     return dirFileName; // fallback
 }
 
-// ------------------------------------------------------------------------
-//  CPackedStoreBuilder::UnpackStoreDifferences()
-// ------------------------------------------------------------------------
-void CPackedStoreBuilder::UnpackStoreDifferences(
-    const VPKDir_t& fallbackDir,     // Typically English
-    const VPKDir_t& otherLangDir,    // Current language
-    const std::string& fallbackOutputPath, // e.g. outPath/content/english/
-    const std::string& langOutputPath      // e.g. outPath/content/spanish/
-)
-{
-    namespace fs = std::filesystem;
-
-    // We'll read from the "otherLangDir" chunk files
-    // For each file in 'otherLangDir', check if it is truly different from fallback.
-    // If yes, physically extract. If no, skip.
-
-    // Build a quick index: (CRC -> vector<filePaths>) for fallback or something chunk-based.
-    // For simplest approach, do file-level compare via CRC.
-    // If the entire file's CRC matches fallback's CRC, skip.
-
-    // 1) Make a map from <entryPath> to <CRC> for the fallback
-    std::unordered_map<std::string, uint32_t> fallbackCrcMap;
-    for (auto& fbBlock : fallbackDir.m_EntryBlocks)
-    {
-        fallbackCrcMap[fbBlock.m_EntryPath] = fbBlock.m_nFileCRC;
-    }
-
-    // 2) Open chunk file(s) for reading
-    // Because we typically have only one .vpk data pack, the offset might be the same.
-    // But in multi-lingual, you can also have separate data packs.
-    // We'll do a naive approach: for each block, open its pack file by index.
-
-    fs::path baseDir = fs::path(otherLangDir.m_DirFilePath).parent_path();
-    std::ifstream ifsPak;
-
-    // 3) For each block in 'otherLangDir'
-    for (auto& block : otherLangDir.m_EntryBlocks)
-    {
-        auto itCrc = fallbackCrcMap.find(block.m_EntryPath);
-        bool sameAsFallback = (itCrc != fallbackCrcMap.end()
-            && itCrc->second == block.m_nFileCRC);
-
-        // if the file is the same as fallback (via CRC), skip extracting
-        if (sameAsFallback)
-            continue;
-
-        // We physically extract it
-        // 3a) open the correct data file once we know block.m_iPackFileIndex
-        std::string packFileName = otherLangDir.GetPackFileNameForIndex(block.m_iPackFileIndex);
-        fs::path fullPakPath = baseDir / packFileName;
-        if (!ifsPak.is_open() || ifsPak.tellg() != std::streampos(0) || /* naive check */ true)
-        {
-            ifsPak.close();
-            ifsPak.open(fullPakPath, std::ios::binary);
-            if (!ifsPak.good())
-            {
-                std::cerr << "[ReVPK] ERROR: cannot open " << fullPakPath
-                    << " for reading\n";
-                continue;
-            }
-        }
-
-        // 3b) open output file
-        fs::path outFile = fs::path(langOutputPath) / block.m_EntryPath;
-        fs::create_directories(outFile.parent_path());
-        std::ofstream ofsOut(outFile, std::ios::binary);
-        if (!ofsOut.is_open())
-        {
-            std::cerr << "[ReVPK] ERROR: cannot create " << outFile << "\n";
-            continue;
-        }
-
-        // 3c) read each chunk
-        std::unique_ptr<uint8_t[]> srcBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
-        std::unique_ptr<uint8_t[]> dstBuf(new uint8_t[VPK_ENTRY_MAX_LEN]);
-
-        for (auto& frag : block.m_Fragments)
-        {
-            // if packFileOffset/CompressedSize=0 => deduplicated chunk from somewhere else
-            if (frag.m_nPackFileOffset == 0 && frag.m_nCompressedSize == 0)
-                continue;
-
-            ifsPak.seekg(frag.m_nPackFileOffset, std::ios::beg);
-            if (!ifsPak.good())
-            {
-                std::cerr << "[ReVPK] ERROR: Bad seek in " << fullPakPath << "\n";
-                break;
-            }
-
-            ifsPak.read(reinterpret_cast<char*>(srcBuf.get()), frag.m_nCompressedSize);
-
-            // decompress if needed
-            if (frag.m_nCompressedSize == frag.m_nUncompressedSize)
-            {
-                // uncompressed
-                ofsOut.write(reinterpret_cast<const char*>(srcBuf.get()), frag.m_nUncompressedSize);
-            }
-            else
-            {
-                // check for ZSTD marker
-                if (frag.m_nCompressedSize >= sizeof(R1D_marker))
-                {
-                    uint64_t possibleMarker = 0;
-                    std::memcpy(&possibleMarker, srcBuf.get(), sizeof(R1D_marker));
-                    if (possibleMarker == R1D_marker)
-                    {
-                        // ZSTD chunk
-                        size_t zstdSize = frag.m_nCompressedSize - sizeof(R1D_marker);
-                        const uint8_t* zstdData = srcBuf.get() + sizeof(R1D_marker);
-                        size_t dstLen = VPK_ENTRY_MAX_LEN;
-                        size_t dRes = ZSTD_decompress(dstBuf.get(), dstLen, zstdData, zstdSize);
-                        if (!ZSTD_isError(dRes))
-                        {
-                            ofsOut.write(reinterpret_cast<const char*>(dstBuf.get()), dRes);
-                        }
-                        else
-                        {
-                            std::cerr << "[ReVPK] ERROR: ZSTD decompress failed.\n";
-                        }
-                        continue;
-                    }
-                }
-                // LZHAM path
-                size_t dstLen = VPK_ENTRY_MAX_LEN;
-                lzham_decompress_status_t st = lzham_decompress_memory(
-                    &m_Decoder,
-                    dstBuf.get(), &dstLen,
-                    srcBuf.get(), static_cast<size_t>(frag.m_nCompressedSize),
-                    nullptr
-                );
-                if (st == LZHAM_DECOMP_STATUS_SUCCESS)
-                {
-                    ofsOut.write(reinterpret_cast<const char*>(dstBuf.get()), dstLen);
-                }
-                else
-                {
-                    std::cerr << "[ReVPK] ERROR: LZHAM decompress failed.\n";
-                }
-            }
-        }
-    }
-
-    ifsPak.close();
-}
 
 // ------------------------------------------------------------------------
 //  CPackedStoreBuilder::BuildMultiLangManifest()
@@ -1094,97 +1185,106 @@ bool CPackedStoreBuilder::BuildMultiLangManifest(
     if (!ofs.good())
         return false;
 
-    ofs << "\"BuildManifest\"\n{\n";
+    // 1) Create a top-level object so we can store multi-language data
+    tyti::vdf::object root;
+    // Keep the same name as “BuildManifest” so code checking doc.name remains valid
+    root.name = "BuildManifest";
 
-    // 1) Gather all file paths across all languages
+    // 2) Gather all file paths across all languages
     std::set<std::string> allFilePaths;
     for (const auto& langPair : languageDirs)
     {
-        const VPKDir_t& vpkDir = langPair.second;
-        for (const auto& blk : vpkDir.m_EntryBlocks)
+        for (const auto& blk : langPair.second.m_EntryBlocks)
             allFilePaths.insert(blk.m_EntryPath);
     }
 
-    // 2) Build a map of English CRCs (or blocks)
-    std::unordered_map<std::string, const VPKEntryBlock_t*> englishMap;
-    auto itEnglish = languageDirs.find("english");
-    if (itEnglish != languageDirs.end())
-    {
-        for (const auto& blk : itEnglish->second.m_EntryBlocks)
-        {
-            englishMap[blk.m_EntryPath] = &blk;
-        }
-    }
-
-    // 3) For each language, write sub-block
+    // 3) For each language, build a sub-object, then fill sub-children
     for (const auto& langPair : languageDirs)
     {
         const std::string& lang = langPair.first;
-        const VPKDir_t&    vpkDir = langPair.second;
+        const VPKDir_t& vpkDir = langPair.second;
 
-        // Build a quick map for this language, path -> block
+        // Create/find a language child
+        auto itLang = root.childs.find(lang);
+        if (itLang == root.childs.end())
+        {
+            auto newLang = std::make_unique<tyti::vdf::object>();
+            newLang->name = lang;
+            root.add_child(std::move(newLang));
+            itLang = root.childs.find(lang);
+        }
+        tyti::vdf::object* langObj = itLang->second.get();
+
+        // Build a quick lookup for this language
         std::unordered_map<std::string, const VPKEntryBlock_t*> thisLangMap;
         for (const auto& blk : vpkDir.m_EntryBlocks)
         {
             thisLangMap[blk.m_EntryPath] = &blk;
         }
 
-        ofs << "\t\"" << lang << "\"\n\t{\n";
-
-        // 4) Iterate all possible file paths
-        for (const std::string& filePath : allFilePaths)
+        // For each possible file path, create a child with appropriate attributes
+        for (const auto& filePath : allFilePaths)
         {
-            // Check if this language has a custom block
-            auto itBlock = thisLangMap.find(filePath);
             const VPKEntryBlock_t* blockPtr = nullptr;
+
+            // Language-specific or fallback to English
+            auto itBlock = thisLangMap.find(filePath);
             if (itBlock != thisLangMap.end())
             {
-                // Language has a unique (or differing) version
                 blockPtr = itBlock->second;
             }
             else
             {
-                // Fallback to English (if English has it)
-                auto itEng = englishMap.find(filePath);
-                if (itEng != englishMap.end())
-                    blockPtr = itEng->second;
-            }
-
-            // If we found a block (either language or fallback), write a manifest entry
-            if (blockPtr)
-            {
-                bool compressed = false;
-                for (const auto& frag : blockPtr->m_Fragments)
+                // fallback to english (if present)
+                auto itEnglish = languageDirs.find("english");
+                if (itEnglish != languageDirs.end())
                 {
-                    if (frag.m_nCompressedSize < frag.m_nUncompressedSize)
+                    for (auto &engBlk : itEnglish->second.m_EntryBlocks)
                     {
-                        compressed = true;
-                        break;
+                        if (engBlk.m_EntryPath == filePath)
+                        {
+                            blockPtr = &engBlk;
+                            break;
+                        }
                     }
                 }
-
-                ofs << "\t\t\"" << filePath << "\"\n"
-                    << "\t\t{\n"
-                    << "\t\t\t\"preloadSize\"\t\"" << blockPtr->m_iPreloadSize << "\"\n"
-                    << "\t\t\t\"loadFlags\"\t\""
-                            << (blockPtr->m_Fragments.empty()
-                                ? 3
-                                : blockPtr->m_Fragments[0].m_nLoadFlags)
-                            << "\"\n"
-                    << "\t\t\t\"textureFlags\"\t\""
-                            << (blockPtr->m_Fragments.empty()
-                                ? 0
-                                : blockPtr->m_Fragments[0].m_nTextureFlags)
-                            << "\"\n"
-                    << "\t\t\t\"useCompression\"\t\"" << (compressed ? "1" : "0") << "\"\n"
-                    << "\t\t\t\"deDuplicate\"\t\"1\"\n"
-                    << "\t\t}\n";
             }
-        }
 
-        ofs << "\t}\n";
+            if (!blockPtr) continue; // not found in current or english => skip
+
+            bool compressed = false;
+            for (const auto& frag : blockPtr->m_Fragments)
+            {
+                if (frag.m_nCompressedSize < frag.m_nUncompressedSize)
+                {
+                    compressed = true;
+                    break;
+                }
+            }
+
+            // Build a child node
+            auto fileObj = std::make_unique<tyti::vdf::object>();
+            fileObj->name = filePath;
+            fileObj->attribs["preloadSize"]    = std::to_string(blockPtr->m_iPreloadSize);
+            fileObj->attribs["loadFlags"]      =
+                std::to_string(blockPtr->m_Fragments.empty()
+                               ? 3
+                               : blockPtr->m_Fragments[0].m_nLoadFlags);
+            fileObj->attribs["textureFlags"]   =
+                std::to_string(blockPtr->m_Fragments.empty()
+                               ? 0
+                               : blockPtr->m_Fragments[0].m_nTextureFlags);
+            fileObj->attribs["useCompression"] = compressed ? "1" : "0";
+            fileObj->attribs["deDuplicate"]    = "1";
+
+            // Add child to language node
+            langObj->add_child(std::move(fileObj));
+        }
     }
 
-    ofs << "}\n";
+    // 4) Use our CSV-based “write” call instead of manual VDF
+    tyti::vdf::WriteOptions wopt;
+    tyti::vdf::write(ofs, root, wopt);
+
     return true;
 }

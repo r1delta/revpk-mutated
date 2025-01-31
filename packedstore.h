@@ -115,6 +115,7 @@ struct VPKEntryBlock_t
     uint16_t                        m_iPackFileIndex; // which .vpk chunk?
     std::vector<VPKChunkDescriptor_t> m_Fragments;
     std::string                     m_EntryPath;
+    std::vector<uint8_t>            m_PreloadData;    // Preload bytes from directory file
 
     // Memory-based constructor (used when packing)
     VPKEntryBlock_t(const uint8_t* pData, size_t nLen, uint64_t nOffset,
@@ -254,7 +255,7 @@ public:
 
 public:
     lzham_compress_params   m_Encoder;
-    lzham_decompress_params m_Decoder;
+    lzham_decompress_state_ptr m_Decoder;
 
     // Dedup map: from SHA1 hash => descriptor
     // so multiple identical chunks get a single copy
