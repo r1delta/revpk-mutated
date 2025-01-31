@@ -17,3 +17,6 @@ this is mit licensed but i dont know how r5sdk licensing works so handle this at
 ## ERRATA
 
 if you put a WAV file or XMA file (if you're on an Xbox 180) into the VPK it will come out "all fucked up" and "distorted" (vitalized's words, not mine)
+SOLUTION:
+Don't do that
+![image](https://github.com/user-attachments/assets/8155e1a3-39b4-402c-a118-78203af13189)
