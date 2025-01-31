@@ -18,6 +18,8 @@ this is mit licensed but i dont know how r5sdk licensing works so handle this at
 
 if you put a WAV file or XMA file (if you're on an Xbox 180) into the VPK it will come out "all fucked up" and "distorted" (vitalized's words, not mine)
 
+this is because of the Preload Section™️
+
 SOLUTION:
 
 Don't do that
