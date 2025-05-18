@@ -16,7 +16,7 @@
 #include <condition_variable>
 #include <functional>
 #include <atomic>
-
+#include <xxhash.h>
 // OpenSSL for SHA
 #include <openssl/sha.h>
 // Zlib for CRC32
@@ -33,15 +33,12 @@ static uint32_t compute_crc32(const uint8_t* data, size_t len)
 /** Helper: do real SHA1 using OpenSSL. Returns hex string. */
 std::string compute_sha1_hex(const uint8_t* data, size_t len)
 {
-    unsigned char hash[SHA_DIGEST_LENGTH];
-    SHA1(data, len, hash);
+    XXH64_hash_t hash = XXH64(data, len, 0);  // 0 is the seed
+    // Convert to string for map key - using hex for readability
+    char buffer[17];  // 16 chars + null terminator
+snprintf(buffer, sizeof(buffer), "%016lx", hash);
 
-    // Convert to hex string
-    char hexbuf[SHA_DIGEST_LENGTH * 2 + 1];
-    for (int i = 0; i < SHA_DIGEST_LENGTH; i++)
-        std::sprintf(hexbuf + (i * 2), "%02x", hash[i]);
-    hexbuf[SHA_DIGEST_LENGTH * 2] = '\0';
-    return std::string(hexbuf);
+    return std::string(buffer);
 }
 
 /**
@@ -383,79 +380,6 @@ void CPackedStoreBuilder::PackStore(const VPKPair_t& vpkPair, const char* worksp
 
     m_ChunkHashMap.clear();
 }
-// --------------------
-// Simple thread pool class
-// --------------------
-class ThreadPool {
-public:
-    ThreadPool(size_t numThreads)
-        : stop(false), tasksInProgress(0)
-    {
-        for (size_t i = 0; i < numThreads; i++)
-        {
-            workers.emplace_back([this](){
-                while (true)
-                {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(queueMutex);
-                        condition.wait(lock, [this](){ return stop || !tasks.empty(); });
-                        if (stop && tasks.empty())
-                            return;
-                        task = std::move(tasks.front());
-                        tasks.pop();
-                        tasksInProgress++;
-                    }
-                    task();
-                    tasksInProgress--;
-                    waitCondition.notify_all();
-                }
-            });
-        }
-    }
-
-    ~ThreadPool()
-    {
-        {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            stop = true;
-        }
-        condition.notify_all();
-        for (std::thread &worker : workers)
-            worker.join();
-    }
-
-    // Enqueue a task into the pool.
-    void enqueue(std::function<void()> task)
-    {
-        {
-            std::unique_lock<std::mutex> lock(queueMutex);
-            tasks.push(std::move(task));
-        }
-        condition.notify_one();
-    }
-
-    // Block until all tasks have completed.
-    void wait()
-    {
-        std::unique_lock<std::mutex> lock(waitMutex);
-        waitCondition.wait(lock, [this](){
-            std::unique_lock<std::mutex> lock(queueMutex);
-            return tasks.empty() && tasksInProgress.load() == 0;
-        });
-    }
-
-private:
-    std::vector<std::thread> workers;
-    std::queue<std::function<void()>> tasks;
-    std::mutex queueMutex;
-    std::condition_variable condition;
-    bool stop;
-
-    std::mutex waitMutex;
-    std::condition_variable waitCondition;
-    std::atomic<int> tasksInProgress;
-};
 
 // ------------------------------------------------------------------------
 //  Modified CPackedStoreBuilder::UnpackStore (threaded version)
@@ -944,8 +868,8 @@ void VPKDir_t::Init(const std::string& dirFilePath)
     m_bInitFailed = false;
 }
 
-void VPKDir_t::BuildDirectoryFile(const std::string& directoryPath,
-                                  const std::vector<VPKEntryBlock_t>& entryBlocks)
+void VPKDir_t::BuildDirectoryFile(const std::string &directoryPath,
+                                  const std::vector<VPKEntryBlock_t> &entryBlocks)
 {
     std::ofstream ofs(directoryPath, std::ios::binary);
     if (!ofs.is_open())
@@ -953,49 +877,68 @@ void VPKDir_t::BuildDirectoryFile(const std::string& directoryPath,
         std::cerr << "[ReVPK] ERROR: Could not write directory file: " << directoryPath << "\n";
         return;
     }
-
+    
     VPKDirHeader_t header;
     header.m_nHeaderMarker = VPK_HEADER_MARKER;
     header.m_nMajorVersion = VPK_MAJOR_VERSION;
     header.m_nMinorVersion = VPK_MINOR_VERSION;
-    header.m_nDirectorySize= 0;
-    header.m_nSignatureSize= 0;
-
-    ofs.write(reinterpret_cast<const char*>(&header.m_nHeaderMarker),   sizeof(header.m_nHeaderMarker));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nMajorVersion),   sizeof(header.m_nMajorVersion));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nMinorVersion),   sizeof(header.m_nMinorVersion));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nDirectorySize),  sizeof(header.m_nDirectorySize));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nSignatureSize),  sizeof(header.m_nSignatureSize));
-
-    // Build tree
+    header.m_nDirectorySize = 0;  // will be filled in later
+    header.m_nSignatureSize = 0;
+    
+    // Write header placeholder
+    ofs.write(reinterpret_cast<const char*>(&header.m_nHeaderMarker), sizeof(header.m_nHeaderMarker));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nMajorVersion), sizeof(header.m_nMajorVersion));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nMinorVersion), sizeof(header.m_nMinorVersion));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nDirectorySize), sizeof(header.m_nDirectorySize));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nSignatureSize), sizeof(header.m_nSignatureSize));
+    
+    // Build and write the directory tree
     CTreeBuilder builder;
     builder.BuildTree(entryBlocks);
     int nDescriptors = builder.WriteTree(ofs);
-
-    // trailing 0
-    uint8_t z = 0;
-    ofs.write(reinterpret_cast<const char*>(&z), 1);
-
+    
+    // Write one final terminator byte after the tree.
+    uint8_t term = 0;
+    ofs.write(reinterpret_cast<const char*>(&term), sizeof(term));
+    
     auto endPos = ofs.tellp();
-    uint32_t dirSize = static_cast<uint32_t>(std::streamoff(endPos) - sizeof(VPKDirHeader_t));
+    uint32_t dirSize = static_cast<uint32_t>(endPos - static_cast<std::streamoff>(sizeof(VPKDirHeader_t)));
+    
+    // Go back and update the directory header with the actual directory size.
     ofs.seekp(0, std::ios::beg);
-
     header.m_nDirectorySize = dirSize;
-    ofs.write(reinterpret_cast<const char*>(&header.m_nHeaderMarker),   sizeof(header.m_nHeaderMarker));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nMajorVersion),   sizeof(header.m_nMajorVersion));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nMinorVersion),   sizeof(header.m_nMinorVersion));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nDirectorySize),  sizeof(header.m_nDirectorySize));
-    ofs.write(reinterpret_cast<const char*>(&header.m_nSignatureSize),  sizeof(header.m_nSignatureSize));
-
+    ofs.write(reinterpret_cast<const char*>(&header.m_nHeaderMarker), sizeof(header.m_nHeaderMarker));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nMajorVersion), sizeof(header.m_nMajorVersion));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nMinorVersion), sizeof(header.m_nMinorVersion));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nDirectorySize), sizeof(header.m_nDirectorySize));
+    ofs.write(reinterpret_cast<const char*>(&header.m_nSignatureSize), sizeof(header.m_nSignatureSize));
+    
     ofs.close();
-
+    
     std::cout << "[ReVPK] Directory built at " << directoryPath
-    << " with " << entryBlocks.size() << " entries and "
-    << nDescriptors << " descriptors.\n";
+              << " with " << entryBlocks.size() << " entries and "
+              << nDescriptors << " descriptors.\n";
 }
+
+
 
 std::string VPKDir_t::GetPackFileNameForIndex(uint16_t iPackFileIndex) const
 {
+    if (iPackFileIndex == 0x1337)
+    {
+        std::string basename = std::filesystem::path(m_DirFilePath).filename().string();
+        // Check if this is a client or server VPK
+        if (basename.find("client_") != std::string::npos)
+        {
+            return "client_mp_delta_common.bsp.pak000_000.vpk";
+        }
+        else if (basename.find("server_") != std::string::npos)
+        {
+            return "server_mp_delta_common.bsp.pak000_000.vpk";
+        }
+    }
+
+
     std::string stripped = StripLocalePrefix(m_DirFilePath);
     std::string from = "pak000_dir";
     std::string to   = "pak000_";
@@ -1063,76 +1006,80 @@ void VPKDir_t::CTreeBuilder::BuildTree(const std::vector<VPKEntryBlock_t>& entry
     }
 }
 
-int VPKDir_t::CTreeBuilder::WriteTree(std::ofstream& ofs) const
+int VPKDir_t::CTreeBuilder::WriteTree(std::ofstream &ofs) const
 {
     int descriptorCount = 0;
-    for (auto& extPair : m_FileTree)
+    // For each extension:
+    for (const auto &extPair : m_FileTree)
     {
-        ofs.write(extPair.first.c_str(), extPair.first.size());
-        ofs.put('\0');
-
-        for (auto& pathPair : extPair.second)
+        // Write the extension string (including its terminating zero)
+        ofs.write(extPair.first.c_str(), extPair.first.size() + 1);
+        // For each directory (path) within that extension:
+        for (const auto &pathPair : extPair.second)
         {
-            ofs.write(pathPair.first.c_str(), pathPair.first.size());
-            ofs.put('\0');
-
-            for (auto& block : pathPair.second)
+            // Write the directory string with terminating zero
+            ofs.write(pathPair.first.c_str(), pathPair.first.size() + 1);
+            // For each file in that directory:
+            for (const auto &block : pathPair.second)
             {
-                // compute "filename" by removing path + extension
+                // Compute the “filename” (the unqualified filename without extension)
                 std::string filename;
                 {
-                    auto slashPos = block.m_EntryPath.rfind('/');
-                    auto dotPos   = block.m_EntryPath.rfind('.');
-                    if (slashPos == std::string::npos)
-                        slashPos = 0;
-                    else
-                        slashPos += 1;
-                    if (dotPos == std::string::npos || dotPos < slashPos)
-                        dotPos = block.m_EntryPath.size();
-
-                    filename = block.m_EntryPath.substr(slashPos, dotPos - slashPos);
+                    size_t posSlash = block.m_EntryPath.find_last_of("/\\");
+                    size_t posDot   = block.m_EntryPath.rfind('.');
+                    if (posSlash == std::string::npos) {
+                        filename = (posDot == std::string::npos)
+                            ? block.m_EntryPath : block.m_EntryPath.substr(0, posDot);
+                    }
+                    else {
+                        size_t start = posSlash + 1;
+                        if (posDot == std::string::npos || posDot < start)
+                            filename = block.m_EntryPath.substr(start);
+                        else
+                            filename = block.m_EntryPath.substr(start, posDot - start);
+                    }
                 }
+                // Write the filename (with a terminating null)
+                ofs.write(filename.c_str(), filename.size() + 1);
 
-                ofs.write(filename.c_str(), filename.size());
-                ofs.put('\0');
-
-                // write CRC, preload, packFileIndex
-                ofs.write(reinterpret_cast<const char*>(&block.m_nFileCRC),     sizeof(block.m_nFileCRC));
+                // Write the file header information: file CRC (uint32_t), preload size (uint16_t) and pack file index (uint16_t)
+                ofs.write(reinterpret_cast<const char*>(&block.m_nFileCRC), sizeof(block.m_nFileCRC));
                 ofs.write(reinterpret_cast<const char*>(&block.m_iPreloadSize), sizeof(block.m_iPreloadSize));
                 ofs.write(reinterpret_cast<const char*>(&block.m_iPackFileIndex), sizeof(block.m_iPackFileIndex));
 
-                // now chunk descriptors
+                // For each chunk descriptor, write its fields followed by a 16‐bit marker.
                 for (size_t i = 0; i < block.m_Fragments.size(); i++)
                 {
-                    auto& d = block.m_Fragments[i];
-
-                    ofs.write(reinterpret_cast<const char*>(&d.m_nLoadFlags),     sizeof(d.m_nLoadFlags));
-                    ofs.write(reinterpret_cast<const char*>(&d.m_nTextureFlags),  sizeof(d.m_nTextureFlags));
-                    ofs.write(reinterpret_cast<const char*>(&d.m_nPackFileOffset),sizeof(d.m_nPackFileOffset));
-                    ofs.write(reinterpret_cast<const char*>(&d.m_nCompressedSize),sizeof(d.m_nCompressedSize));
-                    ofs.write(reinterpret_cast<const char*>(&d.m_nUncompressedSize),sizeof(d.m_nUncompressedSize));
-
-                    if (i < block.m_Fragments.size() - 1)
-                    {
-                        uint16_t sep = PACKFILEINDEX_SEP;
-                        ofs.write(reinterpret_cast<const char*>(&sep), sizeof(sep));
-                    }
-                    else
-                    {
-                        uint16_t end = PACKFILEINDEX_END;
-                        ofs.write(reinterpret_cast<const char*>(&end), sizeof(end));
-                    }
+                    const VPKChunkDescriptor_t &d = block.m_Fragments[i];
+                    ofs.write(reinterpret_cast<const char*>(&d.m_nLoadFlags), sizeof(d.m_nLoadFlags));
+                    ofs.write(reinterpret_cast<const char*>(&d.m_nTextureFlags), sizeof(d.m_nTextureFlags));
+                    ofs.write(reinterpret_cast<const char*>(&d.m_nPackFileOffset), sizeof(d.m_nPackFileOffset));
+                    ofs.write(reinterpret_cast<const char*>(&d.m_nCompressedSize), sizeof(d.m_nCompressedSize));
+                    ofs.write(reinterpret_cast<const char*>(&d.m_nUncompressedSize), sizeof(d.m_nUncompressedSize));
+                    
+                    // Write a 16‐bit marker: use PACKFILEINDEX_SEP (0x0000) if more chunks follow,
+                    // or PACKFILEINDEX_END (0xFFFF) for the last chunk.
+                    uint16_t marker = (i < block.m_Fragments.size() - 1)
+                        ? PACKFILEINDEX_SEP : PACKFILEINDEX_END;
+                    ofs.write(reinterpret_cast<const char*>(&marker), sizeof(marker));
                     descriptorCount++;
                 }
             }
-            uint8_t zero = 0;
-            ofs.write(reinterpret_cast<const char*>(&zero), 1);
+            // After finishing all files in this path, write a one‐byte terminator.
+            uint8_t term = 0;
+            ofs.write(reinterpret_cast<const char*>(&term), sizeof(term));
         }
-        uint8_t zero = 0;
-        ofs.write(reinterpret_cast<const char*>(&zero), 1);
+        // After finishing all paths for this extension, write a one‐byte terminator.
+        uint8_t term = 0;
+        ofs.write(reinterpret_cast<const char*>(&term), sizeof(term));
     }
+    // Finally, write one extra zero byte after all extensions.
+    uint8_t term = 0;
+    ofs.write(reinterpret_cast<const char*>(&term), sizeof(term));
+    
     return descriptorCount;
 }
+
 
 // ------------------------------------------------------------------------
 //  VPKPair_t
